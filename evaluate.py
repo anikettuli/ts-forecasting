@@ -3,16 +3,20 @@ import numpy as np
 import sys
 import os
 
-def weighted_rmse_score(y_true, y_pred, weights):
+def _clip01(x: float) -> float:
+    return float(np.minimum(np.maximum(x, 0.0), 1.0))
+
+def weighted_rmse_score(y_target, y_pred, w) -> float:
     """Calculates the Skill Score: 1 - sqrt(sum(w*(y-y_hat)^2) / sum(w*y^2))."""
-    numerator = np.sum(weights * (y_true - y_pred) ** 2)
-    denominator = np.sum(weights * y_true ** 2)
+    denom = np.sum(w * y_target ** 2)
     
-    if denominator == 0:
+    if denom == 0:
         return 0.0
-    
-    score = 1 - np.sqrt(numerator / denominator)
-    return float(score)
+        
+    ratio = np.sum(w * (y_target - y_pred) ** 2) / denom
+    clipped = _clip01(ratio)
+    val = 1.0 - clipped
+    return float(np.sqrt(val))
 
 def main(submission_path, data_path="data/test.parquet"):
     if not os.path.exists(submission_path):
@@ -24,7 +28,21 @@ def main(submission_path, data_path="data/test.parquet"):
         return
 
     print(f"Loading submission: {submission_path}")
-    sub_df = pl.read_csv(submission_path)
+    
+    # Try reading with comma, if fail try semicolon
+    try:
+        sub_df = pl.read_csv(submission_path)
+        if "id" not in sub_df.columns or "prediction" not in sub_df.columns:
+            raise ValueError("Columns missing")
+    except:
+        try:
+            # Try semicolon separator
+            sub_df = pl.read_csv(submission_path, separator=";")
+            # Remove whitespace from columns if present
+            sub_df = sub_df.with_columns(pl.col("id").str.strip_chars(), pl.col("prediction"))
+        except Exception as e:
+            print(f"Error reading submission file: {e}")
+            return
 
     print(f"Loading ground truth: {data_path}")
     # We only need meta, target and weights
