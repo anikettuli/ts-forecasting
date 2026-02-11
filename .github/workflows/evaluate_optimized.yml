@@ -1,0 +1,66 @@
+name: Evaluate Optimized Submission
+
+on:
+  push:
+    paths:
+      - 'submission_optimized.csv'
+      - '.github/workflows/evaluate_optimized.yml'
+  workflow_dispatch:
+
+jobs:
+  evaluate-optimized:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install polars numpy pyarrow kaggle
+
+    - name: Download ground truth data
+      env:
+        KAGGLE_USERNAME: anikettuli
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      run: |
+        kaggle competitions download -c ts-forecasting
+        unzip -o ts-forecasting.zip -d data/
+        rm ts-forecasting.zip
+
+    - name: Run Evaluation
+      id: evaluation
+      run: |
+        if [ -f "submission_optimized.csv" ]; then
+          python evaluate.py submission_optimized.csv | tee evaluation_results.txt
+        else
+          echo "Error: submission_optimized.csv not found"
+          echo "submission_optimized.csv not found" > evaluation_results.txt
+          exit 1
+        fi
+
+    - name: Generate Job Summary
+      if: always()
+      run: |
+        echo "# 📊 Optimized Submission Evaluation" >> $GITHUB_STEP_SUMMARY
+        
+        # Extract Score
+        SCORE=$(grep "OVERALL SKILL SCORE" evaluation_results.txt | cut -d: -f2 | xargs)
+        
+        if [ ! -z "$SCORE" ]; then
+          echo "## 🏆 Overall Skill Score: **$SCORE**" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Detailed Report" >> $GITHUB_STEP_SUMMARY
+        echo '```text' >> $GITHUB_STEP_SUMMARY
+        cat evaluation_results.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
