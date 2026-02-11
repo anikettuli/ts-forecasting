@@ -1,135 +1,132 @@
-#!/usr/bin/env python3
 """
-Iteration A: The "Golden" Split & Metric
-Implements weighted_rmse_score and temporal split
+Time Series Forecasting Solution - Iteration A
+Weighted RMSE Score Implementation and Data Loading
 """
 
 import pandas as pd
 import numpy as np
+from typing import Tuple
 import warnings
 
 warnings.filterwarnings("ignore")
 
-import lightgbm as lgb
 
-
-def weighted_rmse_score(y_true, y_pred, weights):
+def weighted_rmse_score(
+    y_true: np.ndarray, y_pred: np.ndarray, weights: np.ndarray
+) -> float:
     """
-    Calculate Weighted RMSE Skill Score.
-    Formula: 1 - sqrt(sum(w * (y - y_hat)^2) / sum(w * y^2))
+    Calculate weighted RMSE score (Skill Score).
+
+    SkillScore = 1 - sqrt(sum(w * (y - y_hat)^2) / sum(w * y^2))
+
+    Args:
+        y_true: Ground truth target values
+        y_pred: Predicted values
+        weights: Sample weights
+
+    Returns:
+        Skill score (higher is better, 1.0 is perfect)
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     weights = np.asarray(weights)
 
-    weighted_se = np.sum(weights * (y_true - y_pred) ** 2)
-    weighted_y2 = np.sum(weights * y_true**2)
+    # Calculate weighted RMSE numerator and denominator
+    weighted_squared_error = np.sum(weights * (y_true - y_pred) ** 2)
+    weighted_y_squared = np.sum(weights * y_true**2)
 
-    if weighted_y2 == 0:
+    # Avoid division by zero
+    if weighted_y_squared == 0:
         return 0.0
 
-    return 1 - np.sqrt(weighted_se / weighted_y2)
+    # Calculate skill score
+    score = 1 - np.sqrt(weighted_squared_error / weighted_y_squared)
+
+    return score
 
 
-def main():
-    print("=" * 70)
-    print("ITERATION A: Golden Split & Metric")
-    print("=" * 70)
+def load_and_split_data(
+    filepath: str = "data/test.parquet",
+    target_col: str = "feature_ch",
+    weight_col: str = "feature_cg",
+    valid_ratio: float = 0.25,
+) -> Tuple[pd.DataFrame, pd.DataFrame, list]:
+    """
+    Load data and split into train/validation based on ts_index.
 
-    # Load data
-    print("\n1. Loading data...")
-    df = pd.read_parquet("data/test.parquet")
-    print(f"   Rows: {len(df):,}, Columns: {len(df.columns)}")
+    Args:
+        filepath: Path to parquet file
+        target_col: Column to use as target
+        weight_col: Column to use as weight
+        valid_ratio: Ratio of data to use for validation (last N% by ts_index)
 
-    # Identify columns
-    print("\n2. Identifying columns...")
-    print(f"   Target: feature_ch")
-    print(f"   Weight: feature_cg")
-    print(f"   ID: id")
-    print(f"   Time index: ts_index")
-    print(f"   Horizons: {sorted(df['horizon'].unique())}")
+    Returns:
+        train_df, valid_df, feature_columns
+    """
+    print("Loading data...")
+    df = pd.read_parquet(filepath)
+    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns")
 
-    # Golden split: last 25% of ts_index as validation
-    print("\n3. Creating temporal split (last 25% for validation)...")
-    split_ts = df["ts_index"].quantile(0.75)
+    # Parse ID components (already present as columns, but verify)
+    # id format: code__sub_code__sub_category__horizon__ts_index
+
+    # Get feature columns (exclude id, target, weight, and metadata columns)
+    exclude_cols = ["id", "code", "sub_code", "sub_category", target_col, weight_col]
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    print(f"Using {len(feature_cols)} features")
+
+    # Determine split point based on ts_index
+    min_ts = df["ts_index"].min()
+    max_ts = df["ts_index"].max()
+    ts_range = max_ts - min_ts
+    split_ts = max_ts - int(ts_range * valid_ratio)
+
+    print(f"Time index range: {min_ts} to {max_ts}")
+    print(f"Validation split at ts_index >= {split_ts}")
+
+    # Split data
     train_df = df[df["ts_index"] < split_ts].copy()
     valid_df = df[df["ts_index"] >= split_ts].copy()
-    print(
-        f"   Train ts_index range: {train_df['ts_index'].min()} - {train_df['ts_index'].max()}"
-    )
-    print(
-        f"   Valid ts_index range: {valid_df['ts_index'].min()} - {valid_df['ts_index'].max()}"
-    )
-    print(f"   Train size: {len(train_df):,} ({len(train_df) / len(df) * 100:.1f}%)")
-    print(f"   Valid size: {len(valid_df):,} ({len(valid_df) / len(df) * 100:.1f}%)")
 
-    # Basic features (just raw features, no engineering yet)
-    exclude = ["id", "code", "sub_code", "sub_category", "feature_ch", "feature_cg"]
-    base_features = [
-        c for c in df.columns if c not in exclude and c != "horizon" and c != "ts_index"
-    ]
-    base_features = [c for c in base_features if c.startswith("feature_")]
+    print(f"Train set: {len(train_df):,} rows")
+    print(f"Validation set: {len(valid_df):,} rows")
 
-    print(f"\n4. Using {len(base_features)} raw features (no engineering yet)")
+    return train_df, valid_df, feature_cols
 
-    # Train a simple model as baseline
-    print("\n5. Training baseline LightGBM model...")
-    print("   (No feature engineering, no horizon-specific models yet)")
 
-    # Train on all data together
-    X_train = train_df[base_features].fillna(0)
-    y_train = train_df["feature_ch"].values
-    w_train = train_df["feature_cg"].fillna(1.0).values
-
-    X_valid = valid_df[base_features].fillna(0)
-    y_valid = valid_df["feature_ch"].values
-    w_valid = valid_df["feature_cg"].fillna(1.0).values
-
-    train_data = lgb.Dataset(X_train, label=y_train, weight=w_train)
-    valid_data = lgb.Dataset(
-        X_valid, label=y_valid, weight=w_valid, reference=train_data
-    )
-
-    params = {
-        "objective": "regression",
-        "metric": "rmse",
-        "num_leaves": 31,
-        "max_depth": 6,
-        "learning_rate": 0.1,
-        "verbose": -1,
-        "n_jobs": -1,
-    }
-
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=500,
-        valid_sets=[valid_data],
-        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
-    )
-
-    # Predictions
-    preds = model.predict(X_valid)
-    score = weighted_rmse_score(y_valid, preds, w_valid)
-
-    # Results
-    print("\n" + "=" * 70)
-    print("RESULTS - ITERATION A (Baseline)")
-    print("=" * 70)
-    print(f"Weighted RMSE Score: {score:.4f}")
-    print("=" * 70)
-
-    # Save submission
-    print("\n6. Saving baseline submission...")
-    valid_df["prediction"] = preds
-    submission = valid_df[["id", "prediction"]].copy()
-    submission.to_csv("submission_iter_a.csv", index=False)
-    print(f"   Saved: submission_iter_a.csv")
-
-    print("\n" + "=" * 70)
-    print("ITERATION A COMPLETE - Ready for Iteration B")
-    print("=" * 70)
+def create_submission(
+    df: pd.DataFrame, predictions: np.ndarray, filename: str = "submission.csv"
+):
+    """Create submission file with id and prediction columns."""
+    submission = pd.DataFrame({"id": df["id"], "prediction": predictions})
+    submission.to_csv(filename, index=False)
+    print(f"Submission saved to {filename}")
+    return submission
 
 
 if __name__ == "__main__":
-    main()
+    # Test the functions
+    print("=" * 60)
+    print("Iteration A: Golden Split & Metric")
+    print("=" * 60)
+
+    # Load and split data
+    train_df, valid_df, feature_cols = load_and_split_data()
+
+    # Show sample of data
+    print("\n=== Sample Train Data ===")
+    print(train_df[["id", "ts_index", "horizon", "feature_ch", "feature_cg"]].head())
+
+    print("\n=== Sample Validation Data ===")
+    print(valid_df[["id", "ts_index", "horizon", "feature_ch", "feature_cg"]].head())
+
+    # Test weighted RMSE with dummy predictions
+    y_true = valid_df["feature_ch"].values
+    weights = valid_df["feature_cg"].fillna(1.0).values  # Fill missing weights with 1.0
+    y_pred = np.ones_like(y_true) * y_true.mean()  # Dummy: predict mean
+
+    score = weighted_rmse_score(y_true, y_pred, weights)
+    print(f"\n=== Baseline Score (predict mean) ===")
+    print(f"Weighted RMSE Skill Score: {score:.4f}")
+
+    print("\nIteration A complete!")
