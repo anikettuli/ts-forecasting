@@ -29,9 +29,10 @@ jobs:
 
     - name: Download ground truth data
       env:
-        KAGGLE_USERNAME: anikettuli
-        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_KEY }}
       run: |
+        sudo apt-get update && sudo apt-get install -y unzip
+        mkdir -p data
         kaggle competitions download -c ts-forecasting
         unzip -o ts-forecasting.zip -d data/
         rm ts-forecasting.zip
