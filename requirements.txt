@@ -1,0 +1,7 @@
+cupy-cuda13x
+lightgbm
+numpy
+pandas
+polars
+requests
+scikit-learn

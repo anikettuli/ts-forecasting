@@ -1,273 +1,148 @@
 # AGENTS.md - Development Guidelines for Agentic Coding
 
-This document provides guidelines for agentic coding systems operating in the `ts-forecasting` repository.
+Guidelines for agentic coding systems in `ts-forecasting` repository.
 
 ## Project Overview
 
-**Type**: Python time series forecasting project  
-**Python Version**: 3.13.7  
-**Environment**: Virtual environment at `.venv/`  
-**Key Dependencies**: pandas, numpy, lightgbm, scikit-learn, xgboost
+**Type**: Python GPU-accelerated time series forecasting  
+**Python Version**: 3.13.12  
+**Hardware**: RTX 3070 + CUDA 13.1 + CuPy 13.x  
+**Environment**: Virtual environment at `.venv/` (Windows-style, uses Scripts/)  
+**Primary Libraries**: cupy, polars, lightgbm, scikit-learn  
+**Data Format**: Parquet files in `data/` directory  
+**Main Notebook**: `solution.ipynb` (contains all code)
 
 ## Build, Test & Lint Commands
 
-### Running Scripts
-
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+# Activate venv (WSL style)
+source .venv/Scripts/activate
 
-# Run any single script
-.venv/bin/python iteration_a.py
-.venv/bin/python iteration_b.py
-.venv/bin/python run_pipeline.py
+# Run Jupyter notebook
+.venv/Scripts/jupyter.exe notebook solution.ipynb
 
-# Run full pipeline
-.venv/bin/python run_pipeline.py
-```
+# Quick GPU test
+.venv/Scripts/python.exe -c "import cupy as np; print(f'GPU: {np.cuda.runtime.getDeviceCount()} devices')"
 
-### Running Single Tests
-
-There is no formal test suite yet. To validate changes:
-
-```bash
-# Test a single module by running it
-.venv/bin/python <module_name>.py
-
-# Import and test manually
-.venv/bin/python -c "from iteration_a import weighted_rmse_score; import numpy as np; print(weighted_rmse_score(np.array([1,2,3]), np.array([1,2,3]), np.array([1,1,1])))"
-
-# Validate code with ruff (if needed)
-.venv/bin/python -m ruff check <file.py>
-```
-
-### Environment Setup
-
-```bash
-# If venv doesn't exist
+# Setup
 python3.13 -m venv .venv
-
-# Install dependencies
-.venv/bin/pip install pandas numpy lightgbm scikit-learn xgboost
-
-# Check versions
-.venv/bin/pip list
+.venv/Scripts/pip.exe install -r requirements.txt
 ```
 
 ---
 
 ## Code Style Guidelines
 
-### 1. Imports
+### 1. GPU/CPU Conversion Pattern
 
-**Rules:**
-- Group imports in this order: stdlib → third-party → local
-- Each group separated by a blank line
-- Sort alphabetically within groups
-- Use explicit imports, not `import *`
-- Type hints require `from typing import ...`
+**Critical**: Matrix operations → CuPy (GPU). External libs → NumPy (CPU).
 
-**Good:**
 ```python
-import json
-import warnings
-from typing import Tuple, List, Dict
+import cupy as np
+import numpy as np_cpu
 
-import pandas as pd
-import numpy as np
+def gpu_to_cpu(x):
+    """CuPy GPU → NumPy CPU (handles scalars + arrays)."""
+    if x is None:
+        return None
+    try:
+        if hasattr(x, 'get'):
+            return x.get()
+        elif hasattr(x, 'item'):
+            return x.item()
+        else:
+            return np_cpu.asarray(x)
+    except Exception as e:
+        return np_cpu.asarray(x)
+
+def cpu_to_gpu(x):
+    """NumPy CPU → CuPy GPU."""
+    return np.asarray(x) if x is not None else None
+```
+
+### 2. Imports & Formatting
+- Group: stdlib → third-party → local
+- CuPy imported as `np`, NumPy as `np_cpu`
+- Max line: 100 chars, 4-space indent
+
+```python
+import os
+import sys
+from typing import Tuple, List
+
+import cupy as np
+import numpy as np_cpu
+import polars as pl
+import lightgbm as lgb
 from sklearn.decomposition import PCA
-
-import iteration_a
-from features import create_all_features
 ```
-
-**Bad:**
-```python
-from features import *
-import pandas as pd, numpy as np
-from typing import *
-```
-
----
-
-### 2. Formatting
-
-**Rules:**
-- Max line length: 100 characters (implicit from codebase)
-- Use 4 spaces for indentation (never tabs)
-- Two blank lines between top-level functions/classes
-- One blank line between methods
-- No trailing whitespace
-
-**Function spacing:**
-```python
-def function_one():
-    """Docstring."""
-    pass
-
-
-def function_two():
-    """Docstring."""
-    pass
-```
-
----
 
 ### 3. Type Hints
+- All params and returns typed
+- Use `np.ndarray` for GPU arrays
 
-**Rules:**
-- Always use type hints for function parameters and return types
-- Use `np.ndarray` for numpy arrays, `pd.DataFrame` for dataframes
-- Use `Optional[T]` for nullable values
-- Use tuple unpacking annotations: `Tuple[str, int, list]`
-
-**Good:**
 ```python
 def weighted_rmse_score(
     y_true: np.ndarray, y_pred: np.ndarray, weights: np.ndarray
 ) -> float:
-    """Calculate weighted RMSE skill score."""
-    pass
-
-def load_and_split_data(
-    filepath: str = "data/test.parquet",
-    valid_ratio: float = 0.25,
-) -> Tuple[pd.DataFrame, pd.DataFrame, list]:
-    """Load and split data."""
-    pass
+    """GPU-accelerated metric. Returns Python float."""
 ```
-
-**Bad:**
-```python
-def weighted_rmse_score(y_true, y_pred, weights):
-    pass
-```
-
----
 
 ### 4. Naming Conventions
-
-**Rules:**
-- `snake_case` for functions, variables, module names
-- `PascalCase` for classes (rarely used here)
+- `snake_case` for functions/variables
+- `PascalCase` for classes
 - `UPPER_SNAKE_CASE` for constants
-- Descriptive names; avoid single letters except `i`, `j` in loops
-- Prefix private/internal vars with underscore: `_group_key`, `_temp`
 
-**Good:**
+### 5. Error Handling
+- Check division by zero on GPU: `np.where(std == 0, 1.0, std)`
+- GPU scalars must be converted: `float(train_mean_gpu)`
+
+---
+
+## Data Pipeline Patterns
+
+### Polars (Primary) + CuPy
 ```python
-def create_temporal_features(df, base_features):
-    pass
+# Sort before grouped operations
+df = df.sort(["code", "sub_code", "ts_index"])
 
-feature_cols = [c for c in df.columns if c.startswith("feature_")]
-MAX_HORIZON = 100
+# Lags with leakage prevention (Polars)
+pl.col(feat).shift(1).over(group_cols).alias(f"{feat}_lag1")
+
+# Rolling with shift (Polars)
+pl.col(feat).shift(1).rolling_mean(window_size=7, min_periods=1).over(group_cols)
+
+# Expanding mean with shift (Polars)
+shifted = pl.col(feat).shift(1)
+(shifted.cum_sum() / shifted.cum_count()).over(group_cols).alias(f"{feat}_exp").fill_nan(0)
+
+# GPU-accelerated metric
+y_true_gpu = cpu_to_gpu(df["feature_ch"].to_numpy())
+weights_gpu = cpu_to_gpu(df["feature_cg"].fill_null(1.0).to_numpy())
+score = float(weighted_rmse_score(y_true_gpu, y_pred_gpu, weights_gpu))
 ```
 
-**Bad:**
+### GPU Acceleration Pattern
 ```python
-def CreateTemporalFeatures(df, bf):
-    pass
+# Load to GPU, process, convert to CPU once
+X_train_gpu = cpu_to_gpu(train_df.select(feature_cols).fill_null(0).to_numpy())
+mean_gpu = np.mean(X_train_gpu, axis=0, keepdims=True)
+X_train_scaled = (X_train_gpu - mean_gpu) / std_gpu
 
-f = []
+# Convert to CPU for sklearn/LightGBM
+X_train_np = gpu_to_cpu(X_train_scaled)
 ```
 
 ---
 
-### 5. Docstrings
+## Common Issues to Avoid
 
-**Rules:**
-- All public functions require docstrings
-- Use Google-style docstrings (summary, args, returns)
-- One-line summary ends with period
-- Add examples for complex functions
-
-**Good:**
-```python
-def weighted_rmse_score(
-    y_true: np.ndarray, y_pred: np.ndarray, weights: np.ndarray
-) -> float:
-    """
-    Calculate weighted RMSE skill score.
-
-    SkillScore = 1 - sqrt(sum(w * (y - y_hat)^2) / sum(w * y^2))
-
-    Args:
-        y_true: Ground truth target values
-        y_pred: Predicted values
-        weights: Sample weights
-
-    Returns:
-        Skill score (higher is better, 1.0 is perfect)
-    """
-```
-
----
-
-### 6. Error Handling
-
-**Rules:**
-- Avoid bare `except:` clauses
-- Catch specific exceptions
-- Use meaningful error messages
-- Check for division by zero, NaN, infinity
-
-**Good:**
-```python
-if weighted_y_squared == 0:
-    return 0.0
-
-try:
-    df = pd.read_parquet(filepath)
-except FileNotFoundError as e:
-    print(f"Data file not found: {filepath}")
-    raise
-
-if df.isna().any():
-    print("Warning: NaN values detected")
-```
-
-**Bad:**
-```python
-try:
-    result = sum(array) / 0
-except:
-    pass
-```
-
----
-
-### 7. Data Pipeline Patterns
-
-**Rules:**
-- Always use `.copy()` when creating new dataframes from existing ones
-- Sort dataframes before grouping for consistent results
-- Prevent temporal leakage: use `.shift(1)` before features
-- Reset index after major transformations: `.reset_index(drop=True)`
-- Use group keys for groupby operations
-
-**Good:**
-```python
-df = df.copy()
-df = df.sort_values(["code", "sub_code", "ts_index"]).reset_index(drop=True)
-
-for lag in [1, 2, 3]:
-    df[f"feature_lag{lag}"] = df.groupby("code")[feature].shift(lag)
-
-df["rolling_mean"] = df.groupby("code")[feature].transform(
-    lambda x: x.rolling(7, min_periods=1).mean().shift(1)
-)
-```
-
----
-
-### 8. Common Issues to Avoid
-
-- **Temporal leakage**: Always shift features by 1 when using future data for feature engineering
-- **Missing weights**: Use `.fillna(1.0)` for weight columns
-- **Index confusion**: Reset index after major groupby operations
-- **Mutating inputs**: Always start with `df = df.copy()`
-- **Division by zero**: Check denominator before division
-- **Unmatched dtypes**: Ensure arrays are `np.asarray()` before math operations
+- **Temporal leakage**: Always `.shift(1)` for features
+- **Missing weights**: `.fill_null(1.0)` (Polars)
+- **GPU scalar conversion**: `float(gpu_scalar)` before passing to sklearn
+- **Division by zero**: `np.where(std == 0, 1.0, std)` on GPU
+- **Group confusion**: `.sort()` before `.over()` operations
+- **Excessive GPU↔CPU transfers**: Batch operations, convert once at boundaries
 
 ---
 
@@ -275,41 +150,55 @@ df["rolling_mean"] = df.groupby("code")[feature].transform(
 
 ```
 ts-forecasting/
-├── iteration_a.py           # Baseline: metric & data loading
-├── iteration_b.py           # Feature engineering v1
-├── iteration_c.py           # LightGBM baseline model
-├── iteration_d.py           # Enhanced features + PCA
-├── iter_e_smoothed_encoding.py
-├── features.py              # Feature creation functions
-├── model.py                 # Model training utilities
-├── model_optimized.py       # Optimized model variant
-├── metrics.py               # Metric calculations
-├── run_pipeline.py          # Full pipeline script
-├── full_solution.py         # Complete end-to-end solution
-├── data/                    # Data directory (test.parquet)
-└── .venv/                   # Python virtual environment
+├── solution.ipynb            # Main notebook with 7-step pipeline
+├── data/test.parquet          # Main dataset
+├── requirements.txt           # Dependencies
+└── .venv/Scripts/            # Python virtual environment
 ```
 
 ---
 
-## Key Functions & Utilities
+## Key Functions
 
-- `weighted_rmse_score()`: Custom scoring metric (implementation varies per file)
-- `load_and_split_data()`: Data loading with train/validation split
-- `create_all_features()`: Comprehensive feature engineering pipeline
-- `create_temporal_features()`: Lag and rolling window features
-- `create_target_encoding()`: Target encoding with leakage prevention
+- `weighted_rmse_score()`: SkillScore = 1 - sqrt(sum(w*(y-y_hat)²)/sum(w*y²))
+- `load_and_split_data()`: Split by ts_index
+- `gpu_to_cpu()` / `cpu_to_gpu()`: GPU↔CPU conversion
+- `create_temporal_features_pl()`: Lags, rolling, expanding (Polars)
+- `create_smoothed_target_encoding_pl()`: Target encoding with `.shift(1)`
 
 ---
 
-## Quick Checklist Before Committing
+## Model Training
 
-- [ ] Functions have type hints (params and return)
-- [ ] Public functions have docstrings
-- [ ] Imports are organized and sorted
-- [ ] Lines under 100 characters
-- [ ] `.copy()` used for dataframe mutations
-- [ ] No temporal leakage in feature engineering
-- [ ] Error handling for edge cases (NaN, zero division)
-- [ ] Code follows `snake_case` naming
-- [ ] Tested by running the script end-to-end
+```python
+# GPU preprocessing, CPU LightGBM
+X_train_gpu = cpu_to_gpu(train_df.select(features).fill_null(0).to_numpy())
+X_train_np = gpu_to_cpu(X_train_gpu)
+
+train_data = lgb.Dataset(X_train_np, label=y_train_np, weight=w_train_np)
+
+params = {
+    "objective": "regression",
+    "metric": "rmse",
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "verbose": -1,
+    "n_jobs": -1,
+    "device": "gpu"
+}
+
+model = lgb.train(params, train_data, num_boost_round=1000,
+    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(False)])
+```
+
+---
+
+## Quick Checklist
+
+- [ ] GPU operations with CuPy, CPU ops with NumPy
+- [ ] Type hints on functions
+- [ ] Lines under 100 chars
+- [ ] `.shift(1)` for temporal features
+- [ ] Null handling with `.fill_null()`
+- [ ] GPU scalars converted to Python floats
+- [ ] Tested in Jupyter notebook
