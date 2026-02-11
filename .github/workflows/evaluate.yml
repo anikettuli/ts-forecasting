@@ -1,4 +1,4 @@
-name: Offline Evaluation
+name: Optimized Evaluation
 
 on:
   push:
@@ -11,19 +11,25 @@ jobs:
   evaluate:
     runs-on: ubuntu-latest
     container: python:3.13-slim
+    permissions:
+      contents: read
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install evaluation dependencies
+
+
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install polars numpy pyarrow requests kaggle
+        pip install polars numpy pyarrow kaggle requests
 
     - name: Download ground truth data
       env:
         KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_KEY }}
+        # If running locally or without Kaggle API, you might need another way to fetch data.
+        # But for GitHub Actions, secrets are required.
       run: |
         apt-get update && apt-get install -y unzip
         mkdir -p data
@@ -32,10 +38,34 @@ jobs:
         rm ts-forecasting.zip
 
     - name: Run Evaluation
+      id: evaluation
       run: |
-        # Check if submission file exists
-        if [ -f "submission_final_polars.csv" ]; then
-          python evaluate.py
-        else
-          echo "Skipping evaluation: submission_final_polars.csv not found."
+        # Determine which submission file to use
+        if [ ! -f "submission_optimized.csv" ]; then
+          echo "Error: submission_optimized.csv not found"
+          echo "No submission file found" > evaluation_results.txt
+          exit 1
         fi
+        
+        SUB_FILE="submission_optimized.csv"
+
+        echo "Evaluating: $SUB_FILE"
+        python evaluate.py "$SUB_FILE" | tee evaluation_results.txt
+
+    - name: Generate Job Summary
+      if: always()
+      run: |
+        echo "# 📊 Evaluation Report" >> $GITHUB_STEP_SUMMARY
+        
+        # Extract Score (Updated for new output format: "Overall Skill Score | 0.99...")
+        SCORE=$(grep "Overall Skill Score" evaluation_results.txt | cut -d'|' -f2 | xargs)
+        
+        if [ ! -z "$SCORE" ]; then
+          echo "## 🏆 Overall Skill Score: **$SCORE**" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Detailed Metrics" >> $GITHUB_STEP_SUMMARY
+        echo '```text' >> $GITHUB_STEP_SUMMARY
+        cat evaluation_results.txt >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY

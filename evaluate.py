@@ -24,38 +24,57 @@ def main(submission_path, data_path="data/test.parquet"):
         return
 
     if not os.path.exists(data_path):
-        print(f"Error: Data file '{data_path}' not found.")
+        print(f"Error: Data file '{data_path}' not found. Please download the dataset.")
         return
 
     print(f"Loading submission: {submission_path}")
     
-    # Try reading with comma, if fail try semicolon
     try:
-        sub_df = pl.read_csv(submission_path)
-        if "id" not in sub_df.columns or "prediction" not in sub_df.columns:
-            raise ValueError("Columns missing")
-    except:
-        try:
-            # Try semicolon separator
-            sub_df = pl.read_csv(submission_path, separator=";")
-            # Remove whitespace from columns if present
-            sub_df = sub_df.with_columns(pl.col("id").str.strip_chars(), pl.col("prediction"))
-        except Exception as e:
-            print(f"Error reading submission file: {e}")
-            return
+        # Strictly handle format: Header (comma) -> Data (semicolon)
+        # We skip the first line (header) and read the rest using semicolon separator
+        sub_df = pl.read_csv(
+            submission_path,
+            separator=";",
+            has_header=False,
+            skip_rows=1,
+            new_columns=["id", "prediction"]
+        )
+
+        # Clean up whitespace and cast types
+        sub_df = sub_df.with_columns(
+            pl.col("id").cast(pl.Utf8).str.strip_chars(),
+            pl.col("prediction").cast(pl.Utf8).str.strip_chars().cast(pl.Float64, strict=False)
+        )
+             
+    except Exception as e:
+        print(f"Error reading submission file: {e}")
+        return
+
+    print(f"Submission shape: {sub_df.shape}")
 
     print(f"Loading ground truth: {data_path}")
-    # We only need meta, target and weights
-    gt_df = pl.read_parquet(data_path).select(["id", "feature_ch", "feature_cg", "horizon"])
+    # We need specific columns. If feature_ch (target) is missing, we can't evaluate.
+    required_cols = ["id", "feature_ch", "feature_cg", "horizon"]
+    try:
+        gt_df = pl.read_parquet(data_path).select(required_cols)
+    except Exception as e:
+        print(f"Error reading ground truth file: {e}")
+        print(f"Ensure '{data_path}' contains columns: {required_cols}")
+        return
 
     # Join on id
     eval_df = gt_df.join(sub_df, on="id", how="inner")
 
     if eval_df.height == 0:
         print("Error: No matching IDs found between submission and ground truth.")
+        print("Submission DataFrame Head:")
+        print(sub_df.head())
+        print("Ground Truth IDs Head:")
+        print(gt_df.head())
         return
 
     print(f"Evaluating {eval_df.height:,} matching rows...")
+    print("-" * 60)
 
     # Calculate overall score
     y_true = eval_df["feature_ch"].to_numpy()
@@ -63,12 +82,15 @@ def main(submission_path, data_path="data/test.parquet"):
     weights = eval_df["feature_cg"].fill_null(1.0).to_numpy()
 
     overall_score = weighted_rmse_score(y_true, y_pred, weights)
-    print(f"\n{'='*30}")
-    print(f"OVERALL SKILL SCORE: {overall_score:.6f}")
-    print(f"{'='*30}\n")
+    
+    # Header
+    print(f"{'METRIC':<20} | {'SCORE':<15} | {'ROWS':<10}")
+    print("-" * 60)
+    print(f"{'Overall Skill Score':<20} | {overall_score:.6f}        | {eval_df.height:,}")
+    print("-" * 60)
+    print("Scores by Horizon:")
 
     # Horizon-specific scores
-    print("Scores by Horizon:")
     horizons = sorted(eval_df["horizon"].unique().to_list())
     for h in horizons:
         h_df = eval_df.filter(pl.col("horizon") == h)
@@ -77,7 +99,8 @@ def main(submission_path, data_path="data/test.parquet"):
             h_df["prediction"].to_numpy(),
             h_df["feature_cg"].fill_null(1.0).to_numpy()
         )
-        print(f"  Horizon {h:2}: {h_score:.6f} ({h_df.height:,} rows)")
+        print(f"  Horizon {h:<2}         | {h_score:.6f}        | {h_df.height:,}")
+    print("-" * 60)
 
 if __name__ == "__main__":
     sub_file = "submission_final_polars.csv" if len(sys.argv) < 2 else sys.argv[1]
