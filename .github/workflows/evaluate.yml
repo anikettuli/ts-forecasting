@@ -19,12 +19,18 @@ jobs:
     - name: Install evaluation dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install polars numpy pyarrow requests
+        pip install polars numpy pyarrow requests kaggle
 
     - name: Download ground truth data
+      env:
+        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
       run: |
+        apt-get update && apt-get install -y unzip
         mkdir -p data
-        curl -L -o data/test.parquet "https://storage.googleapis.com/kagglesdsdata/competitions/105581/15271735/test.parquet?GoogleAccessId=web-data@kaggle-161607.iam.gserviceaccount.com&Expires=1770992767&Signature=Fj%2F5LPgyVbzbph1WeG3uCJRMdqsabiq%2BKM3msHzs8y%2BXoHuAzoKKjvFDg3t8ueiPngilQtsFWg4FbUfzajf%2BDqzehOTGwRWzU6bX0xvdrrOeQusa7glpDDnF9n6C0izwzU8k%2FxFDdU7qI6vUtJLm3Yk20zfZMYx%2BuGtFrrtoTzcUx0k5ut%2Ft4OtyyBeCzpsUpCA5EjKMGbqRnB5P%2F7SCEWlwCQ7ZXL8w0kKJGCC3%2FYOqSktMDRhaeLsyP3lfCejur%2BxGfcd8hoLQWsEHOkYEw91k%2F%2BOy6vg5PkpYlQN2Exovmjg3o56VBIAZLLZhU%2BCAvtfL4X%2Bw02HrNJVKi5mhoA%3D%3D&response-content-disposition=attachment%3B+filename%3Dtest.parquet"
+        kaggle competitions download -c ts-forecasting
+        unzip -o ts-forecasting.zip -d data/
+        rm ts-forecasting.zip
 
     - name: Run Evaluation
       run: |
