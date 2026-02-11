@@ -5,3 +5,6 @@ pandas
 polars
 requests
 scikit-learn
+xgboost
+catboost
+scipy
