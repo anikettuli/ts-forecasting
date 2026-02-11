@@ -12,7 +12,35 @@ def add_cell(source_code, cell_type="code"):
         "source": source_code.splitlines(keepends=True)
     })
 
-# --- Cell 1: Imports and Metric ---
+# --- Cell 1: Data Download ---
+code_download = """
+import os
+import requests
+
+def download_data(url, filepath):
+    if os.path.exists(filepath):
+        print(f"File {filepath} already exists. Skipping download.")
+        return
+
+    print(f"Downloading data from {url}...")
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Downloaded to {filepath}")
+    else:
+        print(f"Failed to download. Status code: {response.status_code}")
+
+DATA_URL = "https://storage.googleapis.com/kagglesdsdata/competitions/105581/15271735/test.parquet?GoogleAccessId=web-data@kaggle-161607.iam.gserviceaccount.com&Expires=1770992767&Signature=Fj%2F5LPgyVbzbph1WeG3uCJRMdqsabiq%2BKM3msHzs8y%2BXoHuAzoKKjvFDg3t8ueiPngilQtsFWg4FbUfzajf%2BDqzehOTGwRWzU6bX0xvdrrOeQusa7glpDDnF9n6C0izwzU8k%2FxFDdU7qI6vUtJLm3Yk20zfZMYx%2BuGtFrrtoTzcUx0k5ut%2Ft4OtyyBeCzpsUpCA5EjKMGbqRnB5P%2F7SCEWlwCQ7ZXL8w0kKJGCC3%2FYOqSktMDRhaeLsyP3lfCejur%2BxGfcd8hoLQWsEHOkYEw91k%2F%2BOy6vg5PkpYlQN2Exovmjg3o56VBIAZLLZhU%2BCAvtfL4X%2Bw02HrNJVKi5mhoA%3D%3D&response-content-disposition=attachment%3B+filename%3Dtest.parquet"
+download_data(DATA_URL, "data/test.parquet")
+"""
+add_cell("# Step 0: Download Data", "markdown")
+add_cell(code_download)
+
+# --- Cell 2: Imports and Metric ---
 code_imports = """
 import polars as pl
 import numpy as np
@@ -22,6 +50,7 @@ import lightgbm as lgb
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, List, Dict
+import requests
 
 warnings.filterwarnings("ignore")
 
@@ -29,10 +58,7 @@ warnings.filterwarnings("ignore")
 def weighted_rmse_score(
     y_true: np.ndarray, y_pred: np.ndarray, weights: np.ndarray
 ) -> float:
-    \"\"\"
-    Calculate weighted RMSE score (Skill Score).
-    SkillScore = 1 - sqrt(sum(w * (y - y_hat)^2) / sum(w * y^2))
-    \"\"\"
+
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     weights = np.asarray(weights)
@@ -52,7 +78,7 @@ def weighted_rmse_score(
 add_cell("# Imports & Metric Implementation", "markdown")
 add_cell(code_imports)
 
-# --- Cell 2: Iteration A (Data & Split) ---
+# --- Cell 3: Iteration A (Data & Split) ---
 code_iter_a = """
 # Iteration A: The Golden Split & Metric (Polars)
 
