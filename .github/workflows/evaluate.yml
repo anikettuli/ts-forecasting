@@ -23,8 +23,7 @@ jobs:
 
     - name: Download ground truth data
       env:
-        KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-        KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_KEY }}
       run: |
         apt-get update && apt-get install -y unzip
         mkdir -p data

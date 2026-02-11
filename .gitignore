@@ -1,2 +1,8 @@
 data/test.parquet
-data/test.parquet
+data/train.parquet
+catboost_info/
+*.zip
+.ipynb_checkpoints/
+__pycache__/
+.venv/
+.env
