@@ -29,8 +29,6 @@ python3.13 -m venv .venv
 .venv/Scripts/pip.exe install -r requirements.txt
 ```
 
----
-
 ## Code Style Guidelines
 
 ### 1. GPU/CPU Conversion Pattern
@@ -61,6 +59,7 @@ def cpu_to_gpu(x):
 ```
 
 ### 2. Imports & Formatting
+
 - Group: stdlib → third-party → local
 - CuPy imported as `np`, NumPy as `np_cpu`
 - Max line: 100 chars, 4-space indent
@@ -78,8 +77,8 @@ from sklearn.decomposition import PCA
 ```
 
 ### 3. Type Hints
-- All params and returns typed
-- Use `np.ndarray` for GPU arrays
+
+All params and returns typed. Use `np.ndarray` for GPU arrays.
 
 ```python
 def weighted_rmse_score(
@@ -89,19 +88,20 @@ def weighted_rmse_score(
 ```
 
 ### 4. Naming Conventions
+
 - `snake_case` for functions/variables
 - `PascalCase` for classes
 - `UPPER_SNAKE_CASE` for constants
 
 ### 5. Error Handling
+
 - Check division by zero on GPU: `np.where(std == 0, 1.0, std)`
 - GPU scalars must be converted: `float(train_mean_gpu)`
-
----
 
 ## Data Pipeline Patterns
 
 ### Polars (Primary) + CuPy
+
 ```python
 # Sort before grouped operations
 df = df.sort(["code", "sub_code", "ts_index"])
@@ -123,6 +123,7 @@ score = float(weighted_rmse_score(y_true_gpu, y_pred_gpu, weights_gpu))
 ```
 
 ### GPU Acceleration Pattern
+
 ```python
 # Load to GPU, process, convert to CPU once
 X_train_gpu = cpu_to_gpu(train_df.select(feature_cols).fill_null(0).to_numpy())
@@ -133,8 +134,6 @@ X_train_scaled = (X_train_gpu - mean_gpu) / std_gpu
 X_train_np = gpu_to_cpu(X_train_scaled)
 ```
 
----
-
 ## Common Issues to Avoid
 
 - **Temporal leakage**: Always `.shift(1)` for features
@@ -144,20 +143,6 @@ X_train_np = gpu_to_cpu(X_train_scaled)
 - **Group confusion**: `.sort()` before `.over()` operations
 - **Excessive GPU↔CPU transfers**: Batch operations, convert once at boundaries
 
----
-
-## File Organization
-
-```
-ts-forecasting/
-├── solution.ipynb            # Main notebook with 7-step pipeline
-├── data/test.parquet          # Main dataset
-├── requirements.txt           # Dependencies
-└── .venv/Scripts/            # Python virtual environment
-```
-
----
-
 ## Key Functions
 
 - `weighted_rmse_score()`: SkillScore = 1 - sqrt(sum(w*(y-y_hat)²)/sum(w*y²))
@@ -165,8 +150,6 @@ ts-forecasting/
 - `gpu_to_cpu()` / `cpu_to_gpu()`: GPU↔CPU conversion
 - `create_temporal_features_pl()`: Lags, rolling, expanding (Polars)
 - `create_smoothed_target_encoding_pl()`: Target encoding with `.shift(1)`
-
----
 
 ## Model Training
 
@@ -190,8 +173,6 @@ params = {
 model = lgb.train(params, train_data, num_boost_round=1000,
     callbacks=[lgb.early_stopping(50), lgb.log_evaluation(False)])
 ```
-
----
 
 ## Quick Checklist
 
