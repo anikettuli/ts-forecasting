@@ -1,9 +1,9 @@
 ---
 active: true
-iteration: 0
+iteration: 10
 maxIterations: 100
+sessionId: ses_3b4f65bf0ffe4ke9akR6T45jWa
 ---
-
 
 Objective: Achieve a weighted_rmse_score of 0.90+ using data/test.parquet. Metric: SkillScore=1−∑wy2∑w(y−y^​)2​​
 1. Environment & Constraints
@@ -58,4 +58,4 @@ Implementation Tip for 90% Accuracy:
 
 The metric is effectively a Weighted R² variant. Because it divides by ∑wy2, the model is heavily penalized for missing high-magnitude targets.
 
-    Pro-Tip: Focus your feature engineering on the relationship between code and sub_category. The prompt mentions similarities across these categories—use Target Encoding on the sub_code and sub_category columns, but calculate the means in a "moving window" fashion to prevent data leakage. 
+    Pro-Tip: Focus your feature engineering on the relationship between code and sub_category. The prompt mentions similarities across these categories—use Target Encoding on the sub_code and sub_category columns, but calculate the means in a "moving window" fashion to prevent data leakage.
