@@ -7,7 +7,7 @@ def _clip01(x: float) -> float:
     return float(np.minimum(np.maximum(x, 0.0), 1.0))
 
 def weighted_rmse_score(y_target, y_pred, w) -> float:
-    """Calculates the Skill Score: 1 - sqrt(sum(w*(y-y_hat)^2) / sum(w*y^2))."""
+    """Calculates the Skill Score: sqrt(1 - sum(w*(y-y_hat)^2) / sum(w*y^2))."""
     denom = np.sum(w * y_target ** 2)
     
     if denom == 0:
@@ -30,8 +30,8 @@ def main(submission_path, data_path="data/test.parquet"):
     print(f"Loading submission: {submission_path}")
     
     try:
-        # Strictly handle format: Header (comma) -> Data (semicolon)
-        # We skip the first line (header) and read the rest using semicolon separator
+        # The competition submission format can be quirky: Header (comma) -> Data (semicolon)
+        # We read as semicolon first, skipping the header line.
         sub_df = pl.read_csv(
             submission_path,
             separator=";",
@@ -39,6 +39,15 @@ def main(submission_path, data_path="data/test.parquet"):
             skip_rows=1,
             new_columns=["id", "prediction"]
         )
+
+        # If it failed to split (only 1 column), it might be standard comma-separated
+        if sub_df.width < 2:
+             sub_df = pl.read_csv(
+                submission_path,
+                separator=",",
+                has_header=True
+            )
+             sub_df.columns = ["id", "prediction"]
 
         # Clean up whitespace and cast types
         sub_df = sub_df.with_columns(
