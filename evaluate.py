@@ -29,26 +29,34 @@ def main(submission_path, data_path="data/test.parquet"):
 
     print(f"Loading submission: {submission_path}")
     
+    sub_df = None
+    # Try 1: Standard comma-separated with header (common)
     try:
-        # The competition submission format can be quirky: Header (comma) -> Data (semicolon)
-        # We read as semicolon first, skipping the header line.
-        sub_df = pl.read_csv(
-            submission_path,
-            separator=";",
-            has_header=False,
-            skip_rows=1,
-            new_columns=["id", "prediction"]
-        )
+        sub_df = pl.read_csv(submission_path, separator=",", has_header=True)
+        if sub_df.width >= 2:
+            # Keep only the first two columns (id, prediction)
+            sub_df = sub_df.select(sub_df.columns[:2])
+            sub_df.columns = ["id", "prediction"]
+        else:
+            sub_df = None
+    except Exception:
+        sub_df = None
 
-        # If it failed to split (only 1 column), it might be standard comma-separated
-        if sub_df.width < 2:
-             sub_df = pl.read_csv(
+    # Try 2: Quirky semicolon format (Header comma -> Data semicolon)
+    if sub_df is None:
+        try:
+            sub_df = pl.read_csv(
                 submission_path,
-                separator=",",
-                has_header=True
+                separator=";",
+                has_header=False,
+                skip_rows=1,
+                new_columns=["id", "prediction"]
             )
-             sub_df.columns = ["id", "prediction"]
+        except Exception as e:
+            print(f"Error reading submission file: {e}")
+            return
 
+    try:
         # Clean up whitespace and cast types
         sub_df = sub_df.with_columns(
             pl.col("id").cast(pl.Utf8).str.strip_chars(),
@@ -56,7 +64,7 @@ def main(submission_path, data_path="data/test.parquet"):
         )
              
     except Exception as e:
-        print(f"Error reading submission file: {e}")
+        print(f"Error cleaning submission data: {e}")
         return
 
     print(f"Submission shape: {sub_df.shape}")
