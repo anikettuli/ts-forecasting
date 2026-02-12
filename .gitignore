@@ -6,4 +6,4 @@ catboost_info/
 __pycache__/
 .venv/
 .env
-!submission_optimized.csv
+solution_ref.ipynb
