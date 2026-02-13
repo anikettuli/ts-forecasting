@@ -8,3 +8,8 @@ scikit-learn
 xgboost
 catboost
 scipy
+darts
+statsforecast
+torch
+pytorch-lightning
+marimo
