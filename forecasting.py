@@ -8,9 +8,7 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import os
-    import sys
     import gc
-    import time
     import psutil
     import warnings
     import logging
@@ -18,7 +16,6 @@ def _():
     import polars as pl
     import lightgbm as lgb
     import xgboost as xgb
-    from sklearn.decomposition import IncrementalPCA
 
     # Suppress warnings
     warnings.filterwarnings("ignore")
@@ -34,27 +31,20 @@ def _():
 
         # Optimize for 30-series GPUs (Ampere)
         torch.set_float32_matmul_precision("medium")
-        from darts import TimeSeries
-        from darts.models import NBEATSModel, TFTModel
-        from darts.dataprocessing.transformers import Scaler
 
         # Try importing Statistical Baselines (Prophet, AutoARIMA)
         try:
-            from darts.models import Prophet
-            from darts.models import StatsForecastAutoARIMA
+            import importlib.util
 
-            stats_available = True
+            if importlib.util.find_spec("statsforecast") is None:
+                raise ImportError
         except ImportError:
-            stats_available = False
             print(
                 "⚠️ StatsForecast/Prophet not found. Install 'statsforecast' and 'prophet' for statistical baselines."
             )
 
-        models_available = True
         print("✅ Darts & Torch available for Deep Learning.")
     except ImportError:
-        models_available = False
-        stats_available = False
         print(
             "⚠️ Darts/Torch not found. Deep Learning & Statistical baselines will be skipped."
         )
@@ -154,15 +144,14 @@ def _(TEST_PATH, TRAIN_PATH, mo, pl):
 
 
 @app.cell
-def _(GROUP_COLS, free_memory, mo, pl, tr_lf):
+def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
     mo.md(
         r"""
-    ## 2. Feature Engineering (Hierarchical & Sequential)
+    ## 2. Advanced Feature Engineering
 
-    As per competition tips:
-    1.  **Series Level**: Lags and rolling stats for the specific (code, sub_code, sub_category).
-    2.  **Hierarchy Level**: Aggregated lags for `sub_category` and `code` to capture broader trends.
-    3.  **Recency**: Weights that grow exponentially with `ts_index`.
+    1.  **Hierarchical Trends**: Lagged means for `code` and `sub_category`.
+    2.  **Momentum**: Difference between short and long lags.
+    3.  **Cyclical Time**: sin/cos encoding for day of week/month.
     """
     )
 
@@ -172,15 +161,33 @@ def _(GROUP_COLS, free_memory, mo, pl, tr_lf):
 
     print("Generating Features (Lazy)...")
 
-    # 1. Base Series Features
+    # 1. Base Series Data
     series_lf = tr_lf.sort(GROUP_COLS + ["ts_index"])
 
-    feature_exprs = []
-    # Time Features
-    feature_exprs.append((pl.col("ts_index") % 7).alias("day_of_week"))
-    feature_exprs.append((pl.col("ts_index") % 30).alias("day_of_month"))
+    # --- Hierarchical Aggregations (Pre-shift to avoid leakage) ---
+    cat_agg = tr_lf.group_by(["sub_category", "ts_index"]).agg(
+        pl.col("y_target").mean().alias("cat_y_mean")
+    )
+    code_agg = tr_lf.group_by(["code", "ts_index"]).agg(
+        pl.col("y_target").mean().alias("code_y_mean")
+    )
 
-    # Series-specific Lags & Rolling
+    series_lf = series_lf.join(cat_agg, on=["sub_category", "ts_index"], how="left")
+    series_lf = series_lf.join(code_agg, on=["code", "ts_index"], how="left")
+
+    feature_exprs = []
+
+    # Cyclical Encoding for Time
+    feature_exprs.extend(
+        [
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_sin"),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_cos"),
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 30) / 30.0)).alias("dom_sin"),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 30) / 30.0)).alias("dom_cos"),
+        ]
+    )
+
+    # Series Lags & Rolling
     for lag in LAGS:
         feature_exprs.append(
             pl.col("y_target").shift(lag).over(GROUP_COLS).alias(f"lag_{lag}")
@@ -194,29 +201,33 @@ def _(GROUP_COLS, free_memory, mo, pl, tr_lf):
             .over(GROUP_COLS)
             .alias(f"roll_mean_{w}")
         )
-        feature_exprs.append(
-            pl.col("y_target")
-            .shift(1)
-            .rolling_std(w)
-            .over(GROUP_COLS)
-            .alias(f"roll_std_{w}")
-        )
 
-    # Hierarchy Features (Aggregated Lags - Placeholder for future expansion)
-    # Note: Complex joins on LazyFrames can increase memory. We'll stick to recency weighting first.
+    # Hierarchical Lags (Crucial for "similarities")
+    feature_exprs.append(
+        pl.col("cat_y_mean").shift(1).over(GROUP_COLS).alias("cat_lag_1")
+    )
+    feature_exprs.append(
+        pl.col("code_y_mean").shift(1).over(GROUP_COLS).alias("code_lag_1")
+    )
 
-    # Recency Weighting: Older data is less relevant.
-    # multiplier = exp( (ts_index - max_ts) / max_ts )
+    # Momentum
+    feature_exprs.append(
+        (pl.col("y_target").shift(1) - pl.col("y_target").shift(7))
+        .over(GROUP_COLS)
+        .alias("momentum_7d")
+    )
+
+    # Recency Weights
     max_ts_val = tr_lf.select(pl.col("ts_index").max()).collect().item()
 
-    series_with_features = series_lf.with_columns(feature_exprs)
+    series_with_features = series_lf.with_columns(feature_exprs).fill_null(0.0)
     series_with_features = series_with_features.with_columns(
-        (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 365.0).exp()).alias(
+        (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 180.0).exp()).alias(
             "v_weight"
         )
     )
 
-    # Downcast to save memory
+    # Downcast and Cleanup
     series_with_features = series_with_features.with_columns(
         [
             pl.col(c).cast(pl.Float32)
@@ -228,14 +239,18 @@ def _(GROUP_COLS, free_memory, mo, pl, tr_lf):
     feature_cols = [
         c
         for c in series_with_features.collect_schema().names()
-        if any(x in c for x in ["lag_", "roll_", "day_"])
+        if any(x in c for x in ["lag_", "roll_", "do", "momentum", "cat_", "code_"])
+        and c
+        not in GROUP_COLS
+        + ["ts_index", "y_target", "weight", "v_weight", "cat_y_mean", "code_y_mean"]
     ]
+
     full_series_features = series_with_features.select(
         GROUP_COLS + ["ts_index", "y_target", "v_weight", "weight"] + feature_cols
     )
 
     free_memory()
-    print(f"Feature Definition Created. Total Features: {len(feature_cols)}")
+    print(f"Feature Engineering Complete. Total Features: {len(feature_cols)}")
     return feature_cols, full_series_features
 
 
@@ -261,12 +276,15 @@ def _(
 
     print("Materializing Train/Valid Data...")
 
-    # Train: Use historical data up to split_cutoff
+    print("Materializing Training Data (Log-Target)...")
     train_data = full_series_features.filter(
         pl.col("ts_index") < split_cutoff
     ).collect()
     X_train = train_data.select(feature_cols).to_numpy()
-    y_train = train_data.select("y_target").to_series().to_numpy()
+    # Log transformation for financial target regression
+    y_train = np.log1p(
+        np.maximum(train_data.select("y_target").to_series().to_numpy(), 0.0)
+    )
     w_train = train_data.select("v_weight").to_series().to_numpy()
 
     print(f"X_train shape: {X_train.shape}")
@@ -284,7 +302,7 @@ def _(
     # Track extra info for validation breakdown
     try:
         h_valid = valid_data.select("horizon").to_series().to_numpy()
-    except:
+    except Exception:
         h_valid = np.ones(len(y_valid))  # Dummy if not present
 
     print(f"X_valid shape: {X_valid.shape}")
@@ -297,14 +315,19 @@ def _(
 
     # 1. Prepare test dataframe with mapping key
     test_mapped = te_lf.with_columns(
-        (pl.col("ts_index") - pl.col("horizon") + 1).alias("feature_ts_index")
+        (pl.col("ts_index") - pl.col("horizon") + 1)
+        .cast(pl.Int32)
+        .alias("feature_ts_index")
     )
 
     # 2. Join with pre-computed series features
     # We join features based on the calculated feature_ts_index
+    # Ensure ts_index is Int32 for the join
     test_with_features = (
         test_mapped.join(
-            full_series_features.select(GROUP_COLS + ["ts_index"] + feature_cols),
+            full_series_features.with_columns(pl.col("ts_index").cast(pl.Int32)).select(
+                GROUP_COLS + ["ts_index"] + feature_cols
+            ),
             left_on=GROUP_COLS + ["feature_ts_index"],
             right_on=GROUP_COLS + ["ts_index"],
             how="left",
@@ -325,67 +348,60 @@ def _(
     use_gpu = torch.cuda.is_available()
     print(f"GPU Available: {use_gpu}")
 
-    # LGBM
-    print("Training LightGBM...")
+    # LGBM (Tweedie)
+    print("Training LightGBM (Tweedie)...")
     lgb_params = {
-        "n_estimators": 1000,
-        "learning_rate": 0.05,
-        "num_leaves": 63,
+        "n_estimators": 1500,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
         "device": "gpu" if use_gpu else "cpu",
-        "objective": "regression",
+        "objective": "tweedie",
+        "tweedie_variance_power": 1.5,
         "metric": "rmse",
         "verbose": -1,
         "subsample": 0.5,
         "colsample_bytree": 0.5,
+        "max_bin": 31,
     }
     model_lgb = lgb.LGBMRegressor(**lgb_params)
     model_lgb.fit(
         X_train,
         y_train,
         sample_weight=w_train,
-        eval_set=[(X_valid, y_valid)],
-        eval_sample_weight=[w_valid],
+        eval_set=[(X_valid, np.log1p(np.maximum(y_valid, 0.0)))],
         callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
     )
-    pred_lgb_val = model_lgb.predict(X_valid)
-    pred_lgb_test = model_lgb.predict(X_test)
+    pred_lgb_val = np.expm1(model_lgb.predict(X_valid))
+    pred_lgb_test = np.expm1(model_lgb.predict(X_test))
     del model_lgb
     free_memory()
 
-    # XGBoost
-    print("Training XGBoost...")
+    # XGBoost (Tweedie)
+    print("Training XGBoost (Tweedie)...")
     xgb_params = {
-        "n_estimators": 1000,
-        "learning_rate": 0.05,
-        "max_depth": 6,
+        "n_estimators": 1500,
+        "learning_rate": 0.03,
+        "max_depth": 5,
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
-        "objective": "reg:squarederror",
+        "objective": "reg:tweedie",
+        "tweedie_variance_power": 1.5,
         "early_stopping_rounds": 50,
-        "max_bin": 63,
+        "max_bin": 31,
         "subsample": 0.5,
         "colsample_bytree": 0.5,
     }
 
-    try:
-        model_xgb = xgb.XGBRegressor(**xgb_params)
-        model_xgb.fit(
-            X_train,
-            y_train,
-            sample_weight=w_train,
-            eval_set=[(X_valid, y_valid)],
-            verbose=False,
-        )
-    except Exception as e:
-        print(f"XGBoost Full Training failed ({e}). Using Batched Loop...")
-        # Fallback to batched training if OOM
-        model_xgb = xgb.XGBRegressor(**xgb_params)
-        model_xgb.fit(X_train[:1000000], y_train[:1000000])  # Dummy tiny fit to init
-        # ... real batched loop omitted for brevity in this cell,
-        # but in production you'd use xgb.train with xgb.DMatrix
-
-    pred_xgb_val = model_xgb.predict(X_valid)
-    pred_xgb_test = model_xgb.predict(X_test)
+    model_xgb = xgb.XGBRegressor(**xgb_params)
+    model_xgb.fit(
+        X_train,
+        y_train,
+        sample_weight=w_train,
+        eval_set=[(X_valid, np.log1p(np.maximum(y_valid, 0.0)))],
+        verbose=False,
+    )
+    pred_xgb_val = np.expm1(model_xgb.predict(X_valid))
+    pred_xgb_test = np.expm1(model_xgb.predict(X_test))
     del model_xgb
     free_memory()
     return (
