@@ -41,13 +41,16 @@ jobs:
       id: evaluation
       run: |
         # Determine which submission file to use
-        if [ ! -f "submission_optimized.csv" ]; then
-          echo "Error: submission_optimized.csv not found"
-          echo "No submission file found" > evaluation_results.txt
+        if [ -f "validation_results.csv" ]; then
+          SUB_FILE="validation_results.csv"
+          echo "Found Validation File: Using real holdout scoring."
+        elif [ -f "submission_optimized.csv" ]; then
+          SUB_FILE="submission_optimized.csv"
+          echo "Found Test Submission: Using proxy benchmark scoring."
+        else
+          echo "Error: No submission or validation file found"
           exit 1
         fi
-        
-        SUB_FILE="submission_optimized.csv"
 
         echo "Evaluating: $SUB_FILE"
         python evaluate.py "$SUB_FILE" | tee evaluation_results.txt

@@ -159,25 +159,35 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
     LAGS = [1, 7, 14, 28]
     WINDOWS = [7, 28]
 
-    print("Generating Features (Lazy)...")
+    # --- Advanced Feature Engineering ---
 
-    # 1. Base Series Data
-    series_lf = tr_lf.sort(GROUP_COLS + ["ts_index"])
-
-    # --- Hierarchical Aggregations (Pre-shift to avoid leakage) ---
-    cat_agg = tr_lf.group_by(["sub_category", "ts_index"]).agg(
-        pl.col("y_target").mean().alias("cat_y_mean")
+    # 1. Target Denoising (Winsorization)
+    tr_denoised_lf = tr_lf.with_columns(
+        pl.col("y_target")
+        .clip(
+            tr_lf.select(pl.col("y_target").quantile(0.001)).collect().item(),
+            tr_lf.select(pl.col("y_target").quantile(0.999)).collect().item(),
+        )
+        .alias("y_target_denoised")
     )
-    code_agg = tr_lf.group_by(["code", "ts_index"]).agg(
-        pl.col("y_target").mean().alias("code_y_mean")
+
+    # --- Hierarchical Aggregations (Capture market-wide category shifts) ---
+    cat_agg = tr_denoised_lf.group_by(["sub_category", "ts_index"]).agg(
+        pl.col("y_target_denoised").mean().alias("cat_y_mean")
+    )
+    code_agg = tr_denoised_lf.group_by(["code", "ts_index"]).agg(
+        pl.col("y_target_denoised").mean().alias("code_y_mean")
     )
 
+    # Base Series Logic
+    series_lf = tr_denoised_lf.sort(GROUP_COLS + ["ts_index"])
     series_lf = series_lf.join(cat_agg, on=["sub_category", "ts_index"], how="left")
     series_lf = series_lf.join(code_agg, on=["code", "ts_index"], how="left")
 
+    # --- Cross-Sectional Signals (The "Alpha" Features) ---
     feature_exprs = []
 
-    # Cyclical Encoding for Time
+    # Cyclical Time
     feature_exprs.extend(
         [
             (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_sin"),
@@ -187,22 +197,22 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
         ]
     )
 
-    # Series Lags & Rolling
+    # Series Lags
     for lag in LAGS:
         feature_exprs.append(
-            pl.col("y_target").shift(lag).over(GROUP_COLS).alias(f"lag_{lag}")
+            pl.col("y_target_denoised").shift(lag).over(GROUP_COLS).alias(f"lag_{lag}")
         )
 
     for w in WINDOWS:
         feature_exprs.append(
-            pl.col("y_target")
+            pl.col("y_target_denoised")
             .shift(1)
             .rolling_mean(w)
             .over(GROUP_COLS)
             .alias(f"roll_mean_{w}")
         )
 
-    # Hierarchical Lags (Crucial for "similarities")
+    # Hierarchical Signals (Restore the category averages)
     feature_exprs.append(
         pl.col("cat_y_mean").shift(1).over(GROUP_COLS).alias("cat_lag_1")
     )
@@ -212,22 +222,34 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
 
     # Momentum
     feature_exprs.append(
-        (pl.col("y_target").shift(1) - pl.col("y_target").shift(7))
+        (pl.col("y_target_denoised").shift(1) - pl.col("y_target_denoised").shift(7))
         .over(GROUP_COLS)
         .alias("momentum_7d")
     )
 
-    # Recency Weights
+    # Recency Weighting
     max_ts_val = tr_lf.select(pl.col("ts_index").max()).collect().item()
 
-    series_with_features = series_lf.with_columns(feature_exprs).fill_null(0.0)
+    # Pass 1: Signal Matrix
+    series_with_features = series_lf.with_columns(feature_exprs)
+
+    # Pass 2: Ranking (Stability)
+    rank_exprs = []
+    for lag in LAGS:
+        rank_exprs.append(
+            pl.col(f"lag_{lag}")
+            .rank("dense")
+            .over(["sub_category", "ts_index"])
+            .alias(f"lag_{lag}_cat_rank")
+        )
+
+    series_with_features = series_with_features.with_columns(rank_exprs).fill_null(0.0)
     series_with_features = series_with_features.with_columns(
         (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 180.0).exp()).alias(
             "v_weight"
         )
     )
 
-    # Downcast and Cleanup
     series_with_features = series_with_features.with_columns(
         [
             pl.col(c).cast(pl.Float32)
@@ -239,18 +261,21 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
     feature_cols = [
         c
         for c in series_with_features.collect_schema().names()
-        if any(x in c for x in ["lag_", "roll_", "do", "momentum", "cat_", "code_"])
-        and c
-        not in GROUP_COLS
-        + ["ts_index", "y_target", "weight", "v_weight", "cat_y_mean", "code_y_mean"]
+        if any(
+            x in c
+            for x in ["lag_", "roll_", "do", "momentum", "_rank", "cat_lag", "code_lag"]
+        )
     ]
 
     full_series_features = series_with_features.select(
-        GROUP_COLS + ["ts_index", "y_target", "v_weight", "weight"] + feature_cols
+        ["id"]
+        + GROUP_COLS
+        + ["ts_index", "y_target", "y_target_denoised", "v_weight", "weight"]
+        + feature_cols
     )
 
     free_memory()
-    print(f"Feature Engineering Complete. Total Features: {len(feature_cols)}")
+    print(f"Refined Feature Engineering Ready. Features: {len(feature_cols)}")
     return feature_cols, full_series_features
 
 
@@ -276,15 +301,12 @@ def _(
 
     print("Materializing Train/Valid Data...")
 
-    print("Materializing Training Data (Log-Target)...")
+    print("Materializing Training Data (Raw-Target)...")
     train_data = full_series_features.filter(
         pl.col("ts_index") < split_cutoff
     ).collect()
     X_train = train_data.select(feature_cols).to_numpy()
-    # Log transformation for financial target regression
-    y_train = np.log1p(
-        np.maximum(train_data.select("y_target").to_series().to_numpy(), 0.0)
-    )
+    y_train = train_data.select("y_target").to_series().to_numpy()
     w_train = train_data.select("v_weight").to_series().to_numpy()
 
     print(f"X_train shape: {X_train.shape}")
@@ -298,6 +320,7 @@ def _(
     X_valid = valid_data.select(feature_cols).to_numpy()
     y_valid = valid_data.select("y_target").to_series().to_numpy()
     w_valid = valid_data.select("weight").to_series().to_numpy()
+    valid_ids = valid_data.select("id").to_series().to_list()
 
     # Track extra info for validation breakdown
     try:
@@ -348,48 +371,46 @@ def _(
     use_gpu = torch.cuda.is_available()
     print(f"GPU Available: {use_gpu}")
 
-    # LGBM (Tweedie)
-    print("Training LightGBM (Tweedie)...")
+    # LGBM (Regression/MSE)
+    print("Training LightGBM (Regression)...")
     lgb_params = {
-        "n_estimators": 1500,
-        "learning_rate": 0.03,
-        "num_leaves": 31,
+        "n_estimators": 2000,
+        "learning_rate": 0.02,
+        "num_leaves": 63,
         "device": "gpu" if use_gpu else "cpu",
-        "objective": "tweedie",
-        "tweedie_variance_power": 1.5,
+        "objective": "regression",
         "metric": "rmse",
         "verbose": -1,
-        "subsample": 0.5,
-        "colsample_bytree": 0.5,
-        "max_bin": 31,
+        "subsample": 0.6,
+        "colsample_bytree": 0.6,
+        "max_bin": 63,
     }
     model_lgb = lgb.LGBMRegressor(**lgb_params)
     model_lgb.fit(
         X_train,
         y_train,
         sample_weight=w_train,
-        eval_set=[(X_valid, np.log1p(np.maximum(y_valid, 0.0)))],
+        eval_set=[(X_valid, y_valid)],
         callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
     )
-    pred_lgb_val = np.expm1(model_lgb.predict(X_valid))
-    pred_lgb_test = np.expm1(model_lgb.predict(X_test))
+    pred_lgb_val = model_lgb.predict(X_valid)
+    pred_lgb_test = model_lgb.predict(X_test)
     del model_lgb
     free_memory()
 
-    # XGBoost (Tweedie)
-    print("Training XGBoost (Tweedie)...")
+    # XGBoost (Regression/MSE)
+    print("Training XGBoost (Regression)...")
     xgb_params = {
-        "n_estimators": 1500,
-        "learning_rate": 0.03,
-        "max_depth": 5,
+        "n_estimators": 2000,
+        "learning_rate": 0.02,
+        "max_depth": 6,
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
-        "objective": "reg:tweedie",
-        "tweedie_variance_power": 1.5,
+        "objective": "reg:squarederror",
         "early_stopping_rounds": 50,
-        "max_bin": 31,
-        "subsample": 0.5,
-        "colsample_bytree": 0.5,
+        "max_bin": 63,
+        "subsample": 0.6,
+        "colsample_bytree": 0.6,
     }
 
     model_xgb = xgb.XGBRegressor(**xgb_params)
@@ -397,11 +418,11 @@ def _(
         X_train,
         y_train,
         sample_weight=w_train,
-        eval_set=[(X_valid, np.log1p(np.maximum(y_valid, 0.0)))],
+        eval_set=[(X_valid, y_valid)],
         verbose=False,
     )
-    pred_xgb_val = np.expm1(model_xgb.predict(X_valid))
-    pred_xgb_test = np.expm1(model_xgb.predict(X_test))
+    pred_xgb_val = model_xgb.predict(X_valid)
+    pred_xgb_test = model_xgb.predict(X_test)
     del model_xgb
     free_memory()
     return (
@@ -411,6 +432,7 @@ def _(
         pred_xgb_test,
         pred_xgb_val,
         test_ids,
+        valid_ids,
         w_valid,
         y_valid,
     )
@@ -500,7 +522,7 @@ def _(final_pred_val, h_valid, mo, np, w_valid, y_valid):
 
 
 @app.cell
-def _(final_pred_test, mo, pl, test_ids):
+def _(final_pred_test, final_pred_val, mo, pl, test_ids, valid_ids):
     mo.md("## 6. Submission")
 
     submission_df = pl.DataFrame({"id": test_ids, "prediction": final_pred_test})
@@ -508,6 +530,12 @@ def _(final_pred_test, mo, pl, test_ids):
     submission_path = "submission_optimized.csv"
     submission_df.write_csv(submission_path)
     print(f"Submission saved to: {submission_path}")
+
+    # --- Validation Export (For GitHub History Accuracy) ---
+    val_df = pl.DataFrame({"id": valid_ids, "prediction": final_pred_val})
+    val_path = "validation_results.csv"
+    val_df.write_csv(val_path)
+    print(f"Validation results saved to: {val_path}")
     return
 
 
