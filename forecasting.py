@@ -245,7 +245,7 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
 
     series_with_features = series_with_features.with_columns(rank_exprs).fill_null(0.0)
     series_with_features = series_with_features.with_columns(
-        (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 180.0).exp()).alias(
+        (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 90.0).exp()).alias(
             "v_weight"
         )
     )
@@ -266,16 +266,31 @@ def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
             for x in ["lag_", "roll_", "do", "momentum", "_rank", "cat_lag", "code_lag"]
         )
     ]
+    # Add horizon as a feature so model knows the 'gap' it's predicting
+    if "horizon" not in feature_cols:
+        feature_cols.append("horizon")
 
-    full_series_features = series_with_features.select(
-        ["id"]
+    print("Materializing Feature Matrix into RAM...")
+    all_select_cols = (
+        ["id", "horizon"]
         + GROUP_COLS
         + ["ts_index", "y_target", "y_target_denoised", "v_weight", "weight"]
         + feature_cols
     )
+    # Remove duplicates while preserving order
+    unique_cols = list(dict.fromkeys(all_select_cols))
+
+    print(f"Selecting {len(unique_cols)} columns for materialization...")
+    full_series_features = (
+        series_with_features.select(unique_cols)
+        .with_columns(
+            [pl.col("ts_index").cast(pl.Int32), pl.col("horizon").cast(pl.Int32)]
+        )
+        .collect()
+    )
 
     free_memory()
-    print(f"Refined Feature Engineering Ready. Features: {len(feature_cols)}")
+    print(f"Refined Feature Engineering Ready. Shape: {full_series_features.shape}")
     return feature_cols, full_series_features
 
 
@@ -294,137 +309,168 @@ def _(
     torch,
     xgb,
 ):
-    mo.md("## 3. Training & Prediction Pipeline")
+    mo.md("## 3. Training & Prediction Pipeline (Unified)")
 
-    # Split cutoff for local validation
+    # 1. Configuration & Preparation
     split_cutoff = int(max_ts * 0.9)
+    print(f"Starting Optimized Modeling Pipeline... Split Cutoff: {split_cutoff}")
 
-    print("Materializing Train/Valid Data...")
+    # Feature Pool (For joins) - Exclude metadata to avoid join collisions
+    meta_cols = ["id", "horizon", "y_target", "y_target_denoised", "v_weight", "weight"]
+    feat_only_cols = [c for c in feature_cols if c not in meta_cols]
 
-    print("Materializing Training Data (Raw-Target)...")
-    train_data = full_series_features.filter(
-        pl.col("ts_index") < split_cutoff
-    ).collect()
-    X_train = train_data.select(feature_cols).to_numpy()
-    y_train = train_data.select("y_target").to_series().to_numpy()
-    w_train = train_data.select("v_weight").to_series().to_numpy()
+    feat_pool = full_series_features.select(
+        GROUP_COLS + ["ts_index"] + feat_only_cols
+    ).unique(subset=GROUP_COLS + ["ts_index"])
 
-    print(f"X_train shape: {X_train.shape}")
-    del train_data
-    free_memory()
-
-    # Valid: Use remaining historical data
-    valid_data = full_series_features.filter(
+    # Validation Set
+    valid_base = full_series_features.filter(
         (pl.col("ts_index") >= split_cutoff) & (pl.col("ts_index") <= max_ts)
-    ).collect()
-    X_valid = valid_data.select(feature_cols).to_numpy()
-    y_valid = valid_data.select("y_target").to_series().to_numpy()
-    w_valid = valid_data.select("weight").to_series().to_numpy()
-    valid_ids = valid_data.select("id").to_series().to_list()
+    ).sort(["ts_index"] + GROUP_COLS)
 
-    # Track extra info for validation breakdown
-    try:
-        h_valid = valid_data.select("horizon").to_series().to_numpy()
-    except Exception:
-        h_valid = np.ones(len(y_valid))  # Dummy if not present
+    y_valid = valid_base.select("y_target").to_series().to_numpy().astype(np.float32)
+    w_valid = valid_base.select("weight").to_series().to_numpy().astype(np.float32)
+    valid_ids = valid_base.select("id").to_series().to_list()
+    h_valid = valid_base.select("horizon").to_series().to_numpy().astype(np.int32)
 
-    print(f"X_valid shape: {X_valid.shape}")
-    del valid_data
+    print(f"Validation Target Ready. Size: {len(y_valid):,}")
     free_memory()
 
-    # --- Test Data Construction (The CRITICAL Fix) ---
-    print("Constructing Test Data with Multi-Horizon Mapping...")
-    # Map test row (t_target, horizon) to features at (t_target - horizon + 1)
+    # 2. Unified Training Data
+    print("Preparing Training Set (Pooled Horizons)...")
+    train_sample = full_series_features.filter(
+        pl.col("ts_index") < split_cutoff
+    ).sample(fraction=0.5, seed=42)
 
-    # 1. Prepare test dataframe with mapping key
-    test_mapped = te_lf.with_columns(
-        (pl.col("ts_index") - pl.col("horizon") + 1)
-        .cast(pl.Int32)
-        .alias("feature_ts_index")
-    )
+    X_train = train_sample.select(feature_cols).to_numpy().astype(np.float32)
+    y_train = train_sample.select("y_target").to_series().to_numpy().astype(np.float32)
+    w_train = train_sample.select("v_weight").to_series().to_numpy().astype(np.float32)
 
-    # 2. Join with pre-computed series features
-    # We join features based on the calculated feature_ts_index
-    # Ensure ts_index is Int32 for the join
-    test_with_features = (
-        test_mapped.join(
-            full_series_features.with_columns(pl.col("ts_index").cast(pl.Int32)).select(
-                GROUP_COLS + ["ts_index"] + feature_cols
-            ),
-            left_on=GROUP_COLS + ["feature_ts_index"],
-            right_on=GROUP_COLS + ["ts_index"],
-            how="left",
-        )
-        .fill_null(0.0)
-        .fill_nan(0.0)
-        .collect()
-    )
+    # Safety: Ensure no INF, extreme values, or invalid weights crash LightGBM
+    X_train = np.clip(np.nan_to_num(X_train, 0.0), -1e5, 1e5)
+    y_train = np.clip(np.nan_to_num(y_train, 0.0), -1e4, 1e4)
+    w_train = np.clip(np.nan_to_num(w_train, 1.0), 1e-4, 1e2)
 
-    X_test = test_with_features.select(feature_cols).to_numpy()
-    test_ids = test_with_features.select("id").to_series().to_list()
-
-    print(f"X_test shape: {X_test.shape}")
-    del test_with_features
+    del train_sample
     free_memory()
 
-    # --- Training ---
+    # Simple Monitor Set
+    X_val_m = valid_base.select(feature_cols).to_numpy().astype(np.float32)
+    y_val_m = valid_base.select("y_target").to_series().to_numpy().astype(np.float32)
+    X_val_m = np.clip(np.nan_to_num(X_val_m, 0.0), -1e5, 1e5)
+
+    # 3. Model Training
     use_gpu = torch.cuda.is_available()
-    print(f"GPU Available: {use_gpu}")
+    print(f"Training Unified Models (GPU: {use_gpu})...")
 
-    # LGBM (Regression/MSE)
-    print("Training LightGBM (Regression)...")
-    lgb_params = {
-        "n_estimators": 2000,
-        "learning_rate": 0.02,
-        "num_leaves": 63,
+    # LGBM - Ultra-stable configuration
+    l_params = {
+        "n_estimators": 1200,
+        "learning_rate": 0.03,
+        "num_leaves": 47,
+        "max_depth": 7,
         "device": "gpu" if use_gpu else "cpu",
         "objective": "regression",
         "metric": "rmse",
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "max_bin": 63,
         "verbose": -1,
-        "subsample": 0.6,
-        "colsample_bytree": 0.6,
-        "max_bin": 63,
+        "min_child_samples": 100,
+        "min_split_gain": 0.05,
     }
-    model_lgb = lgb.LGBMRegressor(**lgb_params)
-    model_lgb.fit(
+    l_mod = lgb.LGBMRegressor(**l_params)
+    l_mod.fit(
         X_train,
         y_train,
         sample_weight=w_train,
-        eval_set=[(X_valid, y_valid)],
-        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+        eval_set=[(X_val_m, y_val_m)],
+        callbacks=[lgb.early_stopping(40, verbose=False)],
     )
-    pred_lgb_val = model_lgb.predict(X_valid)
-    pred_lgb_test = model_lgb.predict(X_test)
-    del model_lgb
-    free_memory()
 
-    # XGBoost (Regression/MSE)
-    print("Training XGBoost (Regression)...")
-    xgb_params = {
-        "n_estimators": 2000,
-        "learning_rate": 0.02,
-        "max_depth": 6,
-        "tree_method": "hist",
-        "device": "cuda" if use_gpu else "cpu",
-        "objective": "reg:squarederror",
-        "early_stopping_rounds": 50,
-        "max_bin": 63,
-        "subsample": 0.6,
-        "colsample_bytree": 0.6,
-    }
-
-    model_xgb = xgb.XGBRegressor(**xgb_params)
-    model_xgb.fit(
+    # XGB
+    x_mod = xgb.XGBRegressor(
+        n_estimators=1200,
+        learning_rate=0.03,
+        max_depth=6,
+        tree_method="hist",
+        device="cuda" if use_gpu else "cpu",
+        objective="reg:squarederror",
+        max_bin=63,
+        subsample=0.7,
+        colsample_bytree=0.7,
+    )
+    x_mod.fit(
         X_train,
         y_train,
         sample_weight=w_train,
-        eval_set=[(X_valid, y_valid)],
+        eval_set=[(X_val_m, y_val_m)],
         verbose=False,
     )
-    pred_xgb_val = model_xgb.predict(X_valid)
-    pred_xgb_test = model_xgb.predict(X_test)
-    del model_xgb
+
+    del X_train, y_train, w_train, X_val_m, y_val_m
     free_memory()
+
+    # 4. Multi-Horizon Inference
+    # We apply the correct temporal shift for each horizon during inference
+    pred_lgb_val = np.zeros(len(y_valid), dtype=np.float32)
+    pred_xgb_val = np.zeros(len(y_valid), dtype=np.float32)
+
+    _unique_h = sorted([int(h) for h in np.unique(h_valid)])
+    for h in _unique_h:
+        _mask_v = h_valid == h
+        # Construct features for this horizon specifically
+        feat_v = (
+            valid_base.filter(pl.col("horizon") == h)
+            .with_columns((pl.col("ts_index") - h + 1).cast(pl.Int32).alias("_join_ts"))
+            .join(
+                feat_pool,
+                left_on=GROUP_COLS + ["_join_ts"],
+                right_on=GROUP_COLS + ["ts_index"],
+                how="left",
+            )
+            .fill_null(0.0)
+            .select(feature_cols)
+            .to_numpy()
+            .astype(np.float32)
+        )
+
+        pred_lgb_val[_mask_v] = l_mod.predict(feat_v)
+        pred_xgb_val[_mask_v] = x_mod.predict(feat_v)
+        print(f"   Inference for Horizon {h} complete.")
+
+    # Test Inference
+    print("Generating Test Predictions...")
+    test_rows_all = te_lf.collect().with_columns(
+        (pl.col("ts_index") - pl.col("horizon") + 1).cast(pl.Int32).alias("_join_ts")
+    )
+    test_ids = test_rows_all.select("id").to_series().to_list()
+    test_horizons = (
+        test_rows_all.select("horizon").to_series().to_numpy().astype(np.int32)
+    )
+
+    pred_lgb_test = np.zeros(len(test_ids), dtype=np.float32)
+    pred_xgb_test = np.zeros(len(test_ids), dtype=np.float32)
+
+    for h in _unique_h:
+        _mask_t = test_horizons == h
+        if _mask_t.any():
+            feat_t = (
+                test_rows_all.filter(pl.col("horizon") == h)
+                .join(
+                    feat_pool,
+                    left_on=GROUP_COLS + ["_join_ts"],
+                    right_on=GROUP_COLS + ["ts_index"],
+                    how="left",
+                )
+                .fill_null(0.0)
+                .select(feature_cols)
+                .to_numpy()
+                .astype(np.float32)
+            )
+
+            pred_lgb_test[_mask_t] = l_mod.predict(feat_t)
+            pred_xgb_test[_mask_t] = x_mod.predict(feat_t)
     return (
         h_valid,
         pred_lgb_test,
@@ -507,17 +553,17 @@ def _(final_pred_val, h_valid, mo, np, w_valid, y_valid):
     print("-" * 65)
 
     # Horizon Breakdown
-    unique_h = np.unique(h_valid)
-    if len(unique_h) > 1:
+    _unique_h = np.unique(h_valid)
+    if len(_unique_h) > 1:
         print("\nScores by Horizon:")
         print(f"  {'Horizon':<10} | {'Score':<10} | {'Samples':<10}")
-        for h in sorted(unique_h):
-            mask = h_valid == h
-            if mask.any():
+        for h_eval in sorted(_unique_h):
+            _h_mask = h_valid == h_eval
+            if _h_mask.any():
                 h_score = official_skill_score(
-                    y_valid[mask], final_pred_val[mask], w_valid[mask]
+                    y_valid[_h_mask], final_pred_val[_h_mask], w_valid[_h_mask]
                 )
-                print(f"  {int(h):<10} | {h_score:.6f}   | {mask.sum():,}")
+                print(f"  {int(h_eval):<10} | {h_score:.6f}   | {_h_mask.sum():,}")
     return
 
 
