@@ -1,6 +1,6 @@
 {
   "active": true,
-  "iteration": 1,
+  "iteration": 2,
   "minIterations": 1,
   "maxIterations": 100,
   "completionPromise": "COMPLETE",
@@ -14,5 +14,5 @@
     "opencode:opencode/kimi-k2.5-free",
     "opencode:opencode/minimax-m2.5-free"
   ],
-  "rotationIndex": 0
+  "rotationIndex": 1
 }
