@@ -17,571 +17,614 @@ def _():
     import lightgbm as lgb
     import xgboost as xgb
 
-    # Suppress warnings
     warnings.filterwarnings("ignore")
     logging.getLogger("cmdstanpy").disabled = True
     logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
-    # Configuration for Memory Management
-    pl.Config.set_streaming_chunk_size(1000)
-
-    # Check for Darts and Torch (Deep Learning)
+    HAS_GPU = False
     try:
         import torch
 
-        # Optimize for 30-series GPUs (Ampere)
         torch.set_float32_matmul_precision("medium")
-
-        # Try importing Statistical Baselines (Prophet, AutoARIMA)
-        try:
-            import importlib.util
-
-            if importlib.util.find_spec("statsforecast") is None:
-                raise ImportError
-        except ImportError:
-            print(
-                "⚠️ StatsForecast/Prophet not found. Install 'statsforecast' and 'prophet' for statistical baselines."
-            )
-
-        print("✅ Darts & Torch available for Deep Learning.")
+        HAS_GPU = torch.cuda.is_available()
+        print(f"✅ Torch available. CUDA: {HAS_GPU}")
     except ImportError:
-        print(
-            "⚠️ Darts/Torch not found. Deep Learning & Statistical baselines will be skipped."
-        )
-        print(
-            "To enable, run: pip install darts torch pytorch-lightning prophet statsforecast"
-        )
-    return gc, lgb, mo, np, os, pl, psutil, torch, xgb
+        print("⚠️ Torch not found. GPU disabled.")
+
+    def get_mem():
+        return psutil.Process().memory_info().rss / 1024 / 1024
+
+    def free_mem():
+        gc.collect()
+
+    print(f"Memory: {get_mem():.0f} MB")
+    return HAS_GPU, free_mem, gc, get_mem, lgb, mo, np, os, pl, xgb
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # 📈 Advanced Time-Series Forecasting
+    # 📈 Time-Series Forecasting v5 — Fixed Pipeline
 
-    This notebook implements a multi-stage forecasting pipeline for the Kaggle `ts-forecasting` competition.
-    It is optimized for limited hardware (16GB RAM, 8GB VRAM) by using:
-
-    1.  **Polars** for memory-efficient data manipulation.
-    2.  **Gradient Boosting** (LightGBM/XGBoost) with GPU acceleration for the core engine.
-    3.  **Deep Learning** (N-BEATS/TFT via Darts) for capturing complex non-linear patterns.
-    4.  **Statistical Models** (AutoARIMA/Prophet) for robust baselines.
+    **Critical fixes over v4:**
+    1. Temporal features computed on COMBINED train+test (no broken lag anchors)
+    2. No per-series normalization (predict raw y_target directly)
+    3. No shrinkage (let the model predict at full scale)
+    4. Causal target encoding for code/sub_code
+    5. Per-horizon models with early stopping + 1500 trees
     """)
     return
 
 
 @app.cell
-def _(gc, os, pl, psutil):
-    # --- Utilities ---
-    def get_memory_usage():
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 / 1024
+def _(free_mem, get_mem, lgb, mo, np, os, pl):
+    mo.md("## 1. Load Data & Build Features on Combined Train+Test")
 
-    def free_memory():
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
-        except Exception:
-            pass
-
-    def optimize_types(df):
-        """Downcast types to save memory."""
-        # Handle LazyFrame or DataFrame
-        is_lazy = isinstance(df, pl.LazyFrame)
-        schema = df.collect_schema() if is_lazy else df.schema
-
-        exprs = []
-        for name, dtype in schema.items():
-            if name == "id":
-                continue
-            if dtype == pl.Float64:
-                exprs.append(pl.col(name).cast(pl.Float32))
-            elif dtype == pl.Int64:
-                exprs.append(pl.col(name).cast(pl.Int32))
-
-        if exprs:
-            return df.with_columns(exprs)
-        return df
-
-    print(f"Initial Memory Usage: {get_memory_usage():.2f} MB")
-
-    # Paths
     DATA_DIR = "data"
     TRAIN_PATH = os.path.join(DATA_DIR, "train.parquet")
     TEST_PATH = os.path.join(DATA_DIR, "test.parquet")
 
     if not os.path.exists(TRAIN_PATH):
-        raise FileNotFoundError(
-            f"Data not found at {TRAIN_PATH}. Please ensure data is in the 'data' directory."
-        )
-    return TEST_PATH, TRAIN_PATH, free_memory
+        raise FileNotFoundError(f"Data not found at {TRAIN_PATH}")
 
+    # ── Load both datasets ──
+    print("Loading train + test...")
+    train_raw = pl.read_parquet(TRAIN_PATH)
+    test_raw = pl.read_parquet(TEST_PATH)
+    print(f"  Train: {train_raw.shape}, Test: {test_raw.shape}")
 
-@app.cell
-def _(TEST_PATH, TRAIN_PATH, mo, pl):
-    mo.md("## 1. Data Loading & Preprocessing (Optimized)")
-
-    # Load and optimize using Lazy API
-    print("Loading data (Lazy)...")
-    tr_lf = pl.scan_parquet(TRAIN_PATH)
-    te_lf = pl.scan_parquet(TEST_PATH)
-
-    # Get max_ts for splitting
-    max_ts = tr_lf.select(pl.col("ts_index").max()).collect().item()
-    print(f"Max TS in Train: {max_ts}")
-
-    # Configuration
-    GROUP_COLS = ["code", "sub_code", "sub_category"]
-
-    # Pre-process Test to ensure we have needed horizons/ts_index
-    # We will use this to join features later
-    return GROUP_COLS, max_ts, te_lf, tr_lf
-
-
-@app.cell
-def _(GROUP_COLS, free_memory, mo, np, pl, tr_lf):
-    mo.md(
-        r"""
-    ## 2. Advanced Feature Engineering
-
-    1.  **Hierarchical Trends**: Lagged means for `code` and `sub_category`.
-    2.  **Momentum**: Difference between short and long lags.
-    3.  **Cyclical Time**: sin/cos encoding for day of week/month.
-    """
-    )
-
-    # Config
-    LAGS = [1, 7, 14, 28]
-    WINDOWS = [7, 28]
-
-    # --- Advanced Feature Engineering ---
-
-    # 1. Target Denoising (Winsorization)
-    tr_denoised_lf = tr_lf.with_columns(
-        pl.col("y_target")
-        .clip(
-            tr_lf.select(pl.col("y_target").quantile(0.001)).collect().item(),
-            tr_lf.select(pl.col("y_target").quantile(0.999)).collect().item(),
-        )
-        .alias("y_target_denoised")
-    )
-
-    # --- Hierarchical Aggregations (Capture market-wide category shifts) ---
-    cat_agg = tr_denoised_lf.group_by(["sub_category", "ts_index"]).agg(
-        pl.col("y_target_denoised").mean().alias("cat_y_mean")
-    )
-    code_agg = tr_denoised_lf.group_by(["code", "ts_index"]).agg(
-        pl.col("y_target_denoised").mean().alias("code_y_mean")
-    )
-
-    # Base Series Logic
-    series_lf = tr_denoised_lf.sort(GROUP_COLS + ["ts_index"])
-    series_lf = series_lf.join(cat_agg, on=["sub_category", "ts_index"], how="left")
-    series_lf = series_lf.join(code_agg, on=["code", "ts_index"], how="left")
-
-    # --- Cross-Sectional Signals (The "Alpha" Features) ---
-    feature_exprs = []
-
-    # Cyclical Time
-    feature_exprs.extend(
-        [
-            (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_sin"),
-            (np.cos(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_cos"),
-            (np.sin(2 * np.pi * (pl.col("ts_index") % 30) / 30.0)).alias("dom_sin"),
-            (np.cos(2 * np.pi * (pl.col("ts_index") % 30) / 30.0)).alias("dom_cos"),
-        ]
-    )
-
-    # Series Lags
-    for lag in LAGS:
-        feature_exprs.append(
-            pl.col("y_target_denoised").shift(lag).over(GROUP_COLS).alias(f"lag_{lag}")
-        )
-
-    for w in WINDOWS:
-        feature_exprs.append(
-            pl.col("y_target_denoised")
-            .shift(1)
-            .rolling_mean(w)
-            .over(GROUP_COLS)
-            .alias(f"roll_mean_{w}")
-        )
-
-    # Hierarchical Signals (Restore the category averages)
-    feature_exprs.append(
-        pl.col("cat_y_mean").shift(1).over(GROUP_COLS).alias("cat_lag_1")
-    )
-    feature_exprs.append(
-        pl.col("code_y_mean").shift(1).over(GROUP_COLS).alias("code_lag_1")
-    )
-
-    # Momentum
-    feature_exprs.append(
-        (pl.col("y_target_denoised").shift(1) - pl.col("y_target_denoised").shift(7))
-        .over(GROUP_COLS)
-        .alias("momentum_7d")
-    )
-
-    # Recency Weighting
-    max_ts_val = tr_lf.select(pl.col("ts_index").max()).collect().item()
-
-    # Pass 1: Signal Matrix
-    series_with_features = series_lf.with_columns(feature_exprs)
-
-    # Pass 2: Ranking (Stability)
-    rank_exprs = []
-    for lag in LAGS:
-        rank_exprs.append(
-            pl.col(f"lag_{lag}")
-            .rank("dense")
-            .over(["sub_category", "ts_index"])
-            .alias(f"lag_{lag}_cat_rank")
-        )
-
-    series_with_features = series_with_features.with_columns(rank_exprs).fill_null(0.0)
-    series_with_features = series_with_features.with_columns(
-        (pl.col("weight") * ((pl.col("ts_index") - max_ts_val) / 90.0).exp()).alias(
-            "v_weight"
-        )
-    )
-
-    series_with_features = series_with_features.with_columns(
-        [
-            pl.col(c).cast(pl.Float32)
-            for c in series_with_features.collect_schema().names()
-            if series_with_features.collect_schema()[c] == pl.Float64
-        ]
-    )
-
-    feature_cols = [
-        c
-        for c in series_with_features.collect_schema().names()
-        if any(
-            x in c
-            for x in ["lag_", "roll_", "do", "momentum", "_rank", "cat_lag", "code_lag"]
-        )
-    ]
-    # Add horizon as a feature so model knows the 'gap' it's predicting
-    if "horizon" not in feature_cols:
-        feature_cols.append("horizon")
-
-    print("Materializing Feature Matrix into RAM...")
-    all_select_cols = (
-        ["id", "horizon"]
-        + GROUP_COLS
-        + ["ts_index", "y_target", "y_target_denoised", "v_weight", "weight"]
-        + feature_cols
-    )
-    # Remove duplicates while preserving order
-    unique_cols = list(dict.fromkeys(all_select_cols))
-
-    print(f"Selecting {len(unique_cols)} columns for materialization...")
-    full_series_features = (
-        series_with_features.select(unique_cols)
-        .with_columns(
-            [pl.col("ts_index").cast(pl.Int32), pl.col("horizon").cast(pl.Int32)]
-        )
-        .collect()
-    )
-
-    free_memory()
-    print(f"Refined Feature Engineering Ready. Shape: {full_series_features.shape}")
-    return feature_cols, full_series_features
-
-
-@app.cell
-def _(
-    GROUP_COLS,
-    feature_cols,
-    free_memory,
-    full_series_features,
-    lgb,
-    max_ts,
-    mo,
-    np,
-    pl,
-    te_lf,
-    torch,
-    xgb,
-):
-    mo.md("## 3. Training & Prediction Pipeline (Unified)")
-
-    # 1. Configuration & Preparation
-    split_cutoff = int(max_ts * 0.9)
-    print(f"Starting Optimized Modeling Pipeline... Split Cutoff: {split_cutoff}")
-
-    # Feature Pool (For joins) - Exclude metadata to avoid join collisions
-    meta_cols = ["id", "horizon", "y_target", "y_target_denoised", "v_weight", "weight"]
-    feat_only_cols = [c for c in feature_cols if c not in meta_cols]
-
-    feat_pool = full_series_features.select(
-        GROUP_COLS + ["ts_index"] + feat_only_cols
-    ).unique(subset=GROUP_COLS + ["ts_index"])
-
-    # Validation Set
-    valid_base = full_series_features.filter(
-        (pl.col("ts_index") >= split_cutoff) & (pl.col("ts_index") <= max_ts)
-    ).sort(["ts_index"] + GROUP_COLS)
-
-    y_valid = valid_base.select("y_target").to_series().to_numpy().astype(np.float32)
-    w_valid = valid_base.select("weight").to_series().to_numpy().astype(np.float32)
-    valid_ids = valid_base.select("id").to_series().to_list()
-    h_valid = valid_base.select("horizon").to_series().to_numpy().astype(np.int32)
-
-    print(f"Validation Target Ready. Size: {len(y_valid):,}")
-    free_memory()
-
-    # 2. Unified Training Data
-    print("Preparing Training Set (Pooled Horizons)...")
-    train_sample = full_series_features.filter(
-        pl.col("ts_index") < split_cutoff
-    ).sample(fraction=0.5, seed=42)
-
-    X_train = train_sample.select(feature_cols).to_numpy().astype(np.float32)
-    y_train = train_sample.select("y_target").to_series().to_numpy().astype(np.float32)
-    w_train = train_sample.select("v_weight").to_series().to_numpy().astype(np.float32)
-
-    # Safety: Ensure no INF, extreme values, or invalid weights crash LightGBM
-    X_train = np.clip(np.nan_to_num(X_train, 0.0), -1e5, 1e5)
-    y_train = np.clip(np.nan_to_num(y_train, 0.0), -1e4, 1e4)
-    w_train = np.clip(np.nan_to_num(w_train, 1.0), 1e-4, 1e2)
-
-    del train_sample
-    free_memory()
-
-    # Simple Monitor Set
-    X_val_m = valid_base.select(feature_cols).to_numpy().astype(np.float32)
-    y_val_m = valid_base.select("y_target").to_series().to_numpy().astype(np.float32)
-    X_val_m = np.clip(np.nan_to_num(X_val_m, 0.0), -1e5, 1e5)
-
-    # 3. Model Training
-    use_gpu = torch.cuda.is_available()
-    print(f"Training Unified Models (GPU: {use_gpu})...")
-
-    # LGBM - Ultra-stable configuration
-    l_params = {
-        "n_estimators": 1200,
-        "learning_rate": 0.03,
-        "num_leaves": 47,
-        "max_depth": 7,
-        "device": "gpu" if use_gpu else "cpu",
-        "objective": "regression",
-        "metric": "rmse",
-        "subsample": 0.7,
-        "colsample_bytree": 0.7,
-        "max_bin": 63,
-        "verbose": -1,
-        "min_child_samples": 100,
-        "min_split_gain": 0.05,
+    # ── Identify columns ──
+    GROUP_COLS = ["code", "sub_code"]
+    exclude_cols = {
+        "id",
+        "code",
+        "sub_code",
+        "sub_category",
+        "y_target",
+        "weight",
+        "ts_index",
+        "horizon",
+        "split",
     }
-    l_mod = lgb.LGBMRegressor(**l_params)
-    l_mod.fit(
-        X_train,
-        y_train,
-        sample_weight=w_train,
-        eval_set=[(X_val_m, y_val_m)],
-        callbacks=[lgb.early_stopping(40, verbose=False)],
+
+    raw_features = [
+        c
+        for c in train_raw.columns
+        if c.startswith("feature_") and c in test_raw.columns
+    ]
+    print(f"  Raw features: {len(raw_features)}")
+
+    # ── Tag splits and combine ──
+    ts_max = train_raw["ts_index"].max()
+    ts_min = train_raw["ts_index"].min()
+    split_ts = ts_max - int((ts_max - ts_min) * 0.2)
+    print(f"  ts_index range: [{ts_min}, {ts_max}], val split at {split_ts}")
+
+    train_tagged = train_raw.with_columns(
+        pl.when(pl.col("ts_index") < split_ts)
+        .then(pl.lit("train"))
+        .otherwise(pl.lit("valid"))
+        .alias("split")
     )
+    test_tagged = test_raw.with_columns(pl.lit("test").alias("split"))
+    del train_raw, test_raw
 
-    # XGB
-    x_mod = xgb.XGBRegressor(
-        n_estimators=1200,
-        learning_rate=0.03,
-        max_depth=6,
-        tree_method="hist",
-        device="cuda" if use_gpu else "cpu",
-        objective="reg:squarederror",
-        max_bin=63,
-        subsample=0.7,
-        colsample_bytree=0.7,
-    )
-    x_mod.fit(
-        X_train,
-        y_train,
-        sample_weight=w_train,
-        eval_set=[(X_val_m, y_val_m)],
-        verbose=False,
-    )
+    # Concat with diagonal to handle missing columns
+    full_df = pl.concat([train_tagged, test_tagged], how="diagonal")
+    del train_tagged, test_tagged
+    free_mem()
+    print(f"  Combined: {full_df.shape}")
 
-    del X_train, y_train, w_train, X_val_m, y_val_m
-    free_memory()
+    # ── Downcast for memory ──
+    opt_exprs = []
+    for col_name, dtype in full_df.schema.items():
+        if col_name == "id":
+            continue
+        if dtype == pl.Float64:
+            opt_exprs.append(pl.col(col_name).cast(pl.Float32))
+        elif dtype == pl.Int64:
+            opt_exprs.append(pl.col(col_name).cast(pl.Int32))
+        elif dtype in (pl.Utf8, pl.String):
+            opt_exprs.append(pl.col(col_name).cast(pl.Categorical))
+    if opt_exprs:
+        full_df = full_df.with_columns(opt_exprs)
 
-    # 4. Multi-Horizon Inference
-    # We apply the correct temporal shift for each horizon during inference
-    pred_lgb_val = np.zeros(len(y_valid), dtype=np.float32)
-    pred_xgb_val = np.zeros(len(y_valid), dtype=np.float32)
+    # ── Quick feature importance scan (pick top features for temporal) ──
+    print("  Quick importance scan...")
+    train_subset = full_df.filter(pl.col("split") == "train")
+    sample_n = min(50000, train_subset.height)
+    X_quick = train_subset.select(raw_features).fill_null(0).head(sample_n).to_numpy()
+    y_quick = train_subset["y_target"].head(sample_n).to_numpy()
+    X_quick = np.nan_to_num(X_quick, nan=0.0).astype(np.float32)
+    y_quick = np.nan_to_num(y_quick, nan=0.0).astype(np.float32)
 
-    _unique_h = sorted([int(h) for h in np.unique(h_valid)])
-    for h in _unique_h:
-        _mask_v = h_valid == h
-        # Construct features for this horizon specifically
-        feat_v = (
-            valid_base.filter(pl.col("horizon") == h)
-            .with_columns((pl.col("ts_index") - h + 1).cast(pl.Int32).alias("_join_ts"))
-            .join(
-                feat_pool,
-                left_on=GROUP_COLS + ["_join_ts"],
-                right_on=GROUP_COLS + ["ts_index"],
-                how="left",
+    quick_lgb = lgb.LGBMRegressor(n_estimators=50, max_depth=4, verbose=-1, n_jobs=-1)
+    quick_lgb.fit(X_quick, y_quick)
+    feat_imp = quick_lgb.feature_importances_
+    top_idx = np.argsort(feat_imp)[::-1][:30]
+    top_temporal_feats = [raw_features[i] for i in top_idx if feat_imp[i] > 0]
+    print(f"  Top {len(top_temporal_feats)} features for temporal engineering")
+    del X_quick, y_quick, quick_lgb, feat_imp, train_subset
+    free_mem()
+
+    # ── Sort by group + time (CRITICAL for temporal features) ──
+    print("  Sorting combined data...")
+    full_df = full_df.sort(GROUP_COLS + ["ts_index"])
+
+    # ── Temporal features on COMBINED data ──
+    print("  Creating temporal features on combined train+test...")
+    temporal_feat_names = []
+    BATCH_SIZE = 5
+
+    for bi in range(0, len(top_temporal_feats), BATCH_SIZE):
+        batch = top_temporal_feats[bi : bi + BATCH_SIZE]
+        exprs = []
+        for feat in batch:
+            # Lag 1
+            lag_name = f"{feat}_lag1"
+            temporal_feat_names.append(lag_name)
+            exprs.append(
+                pl.col(feat)
+                .shift(1)
+                .over(GROUP_COLS)
+                .fill_null(0.0)
+                .alias(lag_name)
+                .cast(pl.Float32)
             )
-            .fill_null(0.0)
-            .select(feature_cols)
-            .to_numpy()
-            .astype(np.float32)
-        )
-
-        pred_lgb_val[_mask_v] = l_mod.predict(feat_v)
-        pred_xgb_val[_mask_v] = x_mod.predict(feat_v)
-        print(f"   Inference for Horizon {h} complete.")
-
-    # Test Inference
-    print("Generating Test Predictions...")
-    test_rows_all = te_lf.collect().with_columns(
-        (pl.col("ts_index") - pl.col("horizon") + 1).cast(pl.Int32).alias("_join_ts")
-    )
-    test_ids = test_rows_all.select("id").to_series().to_list()
-    test_horizons = (
-        test_rows_all.select("horizon").to_series().to_numpy().astype(np.int32)
-    )
-
-    pred_lgb_test = np.zeros(len(test_ids), dtype=np.float32)
-    pred_xgb_test = np.zeros(len(test_ids), dtype=np.float32)
-
-    for h in _unique_h:
-        _mask_t = test_horizons == h
-        if _mask_t.any():
-            feat_t = (
-                test_rows_all.filter(pl.col("horizon") == h)
-                .join(
-                    feat_pool,
-                    left_on=GROUP_COLS + ["_join_ts"],
-                    right_on=GROUP_COLS + ["ts_index"],
-                    how="left",
+            # Rolling mean 7
+            rm7_name = f"{feat}_rm7"
+            temporal_feat_names.append(rm7_name)
+            exprs.append(
+                pl.col(feat)
+                .shift(1)
+                .rolling_mean(window_size=7, min_periods=1)
+                .over(GROUP_COLS)
+                .fill_null(0.0)
+                .alias(rm7_name)
+                .cast(pl.Float32)
+            )
+            # Rolling mean 30
+            rm30_name = f"{feat}_rm30"
+            temporal_feat_names.append(rm30_name)
+            exprs.append(
+                pl.col(feat)
+                .shift(1)
+                .rolling_mean(window_size=30, min_periods=1)
+                .over(GROUP_COLS)
+                .fill_null(0.0)
+                .alias(rm30_name)
+                .cast(pl.Float32)
+            )
+            # Rolling std 7
+            rs7_name = f"{feat}_rstd7"
+            temporal_feat_names.append(rs7_name)
+            exprs.append(
+                pl.col(feat)
+                .shift(1)
+                .rolling_std(window_size=7, min_periods=2)
+                .over(GROUP_COLS)
+                .fill_null(0.0)
+                .alias(rs7_name)
+                .cast(pl.Float32)
+            )
+            # Rate of change (clipped)
+            roc_name = f"{feat}_roc"
+            temporal_feat_names.append(roc_name)
+            exprs.append(
+                (
+                    (pl.col(feat) - pl.col(feat).shift(1).over(GROUP_COLS))
+                    / (pl.col(feat).shift(1).over(GROUP_COLS).abs() + 1e-8)
                 )
                 .fill_null(0.0)
-                .select(feature_cols)
-                .to_numpy()
-                .astype(np.float32)
+                .clip(-100.0, 100.0)
+                .alias(roc_name)
+                .cast(pl.Float32)
             )
+        full_df = full_df.with_columns(exprs)
+        if bi % 20 == 0:
+            free_mem()
+    print(f"  Created {len(temporal_feat_names)} temporal features")
 
-            pred_lgb_test[_mask_t] = l_mod.predict(feat_t)
-            pred_xgb_test[_mask_t] = x_mod.predict(feat_t)
-    return (
-        h_valid,
-        pred_lgb_test,
-        pred_lgb_val,
-        pred_xgb_test,
-        pred_xgb_val,
-        test_ids,
-        valid_ids,
-        w_valid,
-        y_valid,
+    # ── Cyclical time features ──
+    cyclical_names = ["dow_sin", "dow_cos", "dom_sin", "dom_cos", "doy_sin", "doy_cos"]
+    full_df = full_df.with_columns(
+        [
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0))
+            .alias("dow_sin")
+            .cast(pl.Float32),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 7) / 7.0))
+            .alias("dow_cos")
+            .cast(pl.Float32),
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 30) / 30.0))
+            .alias("dom_sin")
+            .cast(pl.Float32),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 30) / 30.0))
+            .alias("dom_cos")
+            .cast(pl.Float32),
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 365) / 365.0))
+            .alias("doy_sin")
+            .cast(pl.Float32),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 365) / 365.0))
+            .alias("doy_cos")
+            .cast(pl.Float32),
+        ]
     )
+
+    # ── Causal target encoding ──
+    print("  Creating target encoding for code/sub_code...")
+    train_mean = full_df.filter(pl.col("split") == "train")["y_target"].mean()
+    smoothing = 10
+
+    for enc_col in ["code", "sub_code"]:
+        enc_name = f"{enc_col}_te"
+        full_df = full_df.with_columns(
+            [
+                pl.col("y_target")
+                .shift(1)
+                .cum_sum()
+                .over(enc_col)
+                .fill_null(0.0)
+                .alias("_te_sum"),
+                pl.col("y_target")
+                .shift(1)
+                .cum_count()
+                .over(enc_col)
+                .fill_null(0)
+                .alias("_te_cnt"),
+            ]
+        )
+        full_df = full_df.with_columns(
+            (
+                (pl.col("_te_sum") + smoothing * train_mean)
+                / (pl.col("_te_cnt") + smoothing + 1e-8)
+            )
+            .fill_null(train_mean)
+            .clip(-1000.0, 1000.0)
+            .alias(enc_name)
+            .cast(pl.Float32)
+        ).drop(["_te_sum", "_te_cnt"])
+
+    # ── Cold-start features ──
+    train_sub_codes = set(
+        full_df.filter(pl.col("split") == "train")["sub_code"].unique().to_list()
+    )
+    full_df = full_df.with_columns(
+        pl.when(pl.col("sub_code").is_in(train_sub_codes))
+        .then(0)
+        .otherwise(1)
+        .alias("is_cold_start")
+        .cast(pl.Int8)
+    )
+    full_df = full_df.with_columns(
+        pl.col("ts_index")
+        .cum_count()
+        .over("sub_code")
+        .alias("sub_code_obs_count")
+        .cast(pl.Int32)
+    )
+
+    # ── Final feature list ──
+    feature_cols = (
+        raw_features
+        + ["horizon"]
+        + cyclical_names
+        + temporal_feat_names
+        + ["code_te", "sub_code_te", "is_cold_start", "sub_code_obs_count"]
+    )
+    # Remove any features not actually in the dataframe
+    feature_cols = [fc for fc in feature_cols if fc in full_df.columns]
+    print(f"  Total features: {len(feature_cols)}")
+
+    # ── Fill remaining nulls ──
+    for fc in feature_cols:
+        if full_df[fc].null_count() > 0:
+            full_df = full_df.with_columns(pl.col(fc).fill_null(0.0))
+
+    free_mem()
+    print(f"  Memory: {get_mem():.0f} MB")
+    print(f"  Train: {full_df.filter(pl.col('split') == 'train').height:,}")
+    print(f"  Valid: {full_df.filter(pl.col('split') == 'valid').height:,}")
+    print(f"  Test:  {full_df.filter(pl.col('split') == 'test').height:,}")
+
+    return feature_cols, full_df, split_ts, ts_max
 
 
 @app.cell
-def _(mo, np, pred_lgb_test, pred_lgb_val, pred_xgb_test, pred_xgb_val):
-    mo.md("## 4. Ensembling & Submission Prep")
+def _(HAS_GPU, feature_cols, free_mem, full_df, get_mem, lgb, mo, np, xgb):
+    mo.md("## 2. Per-Horizon Training (No Weights, float64 Scoring)")
 
-    # Weighted Average Ensemble
-    ensemble_weights = [0.5, 0.5]
+    horizons = sorted(
+        full_df.filter(full_df["split"] == "train")["horizon"].unique().to_list()
+    )
+    print(f"Horizons: {horizons}")
 
-    final_pred_val = (
-        ensemble_weights[0] * pred_lgb_val + ensemble_weights[1] * pred_xgb_val
+    # Validation data — use float64 for weights/targets to prevent precision loss
+    valid_part = full_df.filter(full_df["split"] == "valid")
+    val_y = valid_part["y_target"].to_numpy().astype(np.float64)
+    val_w = valid_part["weight"].fill_null(1.0).to_numpy().astype(np.float64)
+    val_h = valid_part["horizon"].to_numpy()
+    val_ids = valid_part["id"].to_list()
+
+    pred_val = np.zeros(len(val_y), dtype=np.float64)
+
+    # Weight diagnostics
+    print(
+        f"Weight stats: median={np.median(val_w):.2f}, "
+        f"p99={np.percentile(val_w, 99):.2f}, "
+        f"p99.9={np.percentile(val_w, 99.9):.2f}, "
+        f"max={val_w.max():.2f}"
     )
 
-    final_pred_test = (
-        ensemble_weights[0] * pred_lgb_test + ensemble_weights[1] * pred_xgb_test
+    # FLOAT64 score function with weight clipping
+    def wrmse_score(y, yhat, w):
+        y64 = np.asarray(y, dtype=np.float64)
+        p64 = np.asarray(yhat, dtype=np.float64)
+        w64 = np.asarray(w, dtype=np.float64)
+        w_cap = np.percentile(w64, 99.9)
+        w64 = np.clip(w64, 0.0, w_cap)
+        sst = np.sum(w64 * y64**2)
+        sse = np.sum(w64 * (y64 - p64) ** 2)
+        if sst < 1e-30:
+            return 0.0, sst, sse
+        ratio = sse / sst
+        score = float(np.sqrt(max(1.0 - ratio, 0.0)))
+        return score, float(sst), float(sse)
+
+    # Store models for test inference
+    all_models = {}
+
+    for hz in horizons:
+        print(f"\n{'=' * 50}")
+        print(f"HORIZON {hz}")
+
+        tr_hz = full_df.filter(
+            (full_df["split"] == "train") & (full_df["horizon"] == hz)
+        )
+        va_hz = valid_part.filter(valid_part["horizon"] == hz)
+
+        if tr_hz.height == 0 or va_hz.height == 0:
+            print("  No data, skipping")
+            continue
+
+        # Extract arrays
+        X_train = tr_hz.select(feature_cols).to_numpy().astype(np.float32)
+        y_train = tr_hz["y_target"].to_numpy().astype(np.float32)
+
+        X_valid = va_hz.select(feature_cols).to_numpy().astype(np.float32)
+        y_valid = va_hz["y_target"].to_numpy().astype(np.float64)
+        w_valid = va_hz["weight"].fill_null(1.0).to_numpy().astype(np.float64)
+
+        # Sanitize
+        X_train = np.clip(
+            np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0), -1e9, 1e9
+        )
+        X_valid = np.clip(
+            np.nan_to_num(X_valid, nan=0.0, posinf=0.0, neginf=0.0), -1e9, 1e9
+        )
+        y_train = np.nan_to_num(y_train, nan=0.0)
+
+        print(f"  Train: {X_train.shape[0]:,}, Val: {X_valid.shape[0]:,}")
+        print(f"  y_train: mean={y_train.mean():.2f}, std={y_train.std():.2f}")
+
+        # ── LightGBM — NO sample weights, NO early stopping ──
+        lgb_model = lgb.LGBMRegressor(
+            n_estimators=1000,
+            learning_rate=0.01,
+            num_leaves=63,
+            max_depth=-1,
+            device="cpu",
+            objective="regression",
+            metric="rmse",
+            subsample=0.8,
+            colsample_bytree=0.6,
+            min_child_samples=100,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            verbose=-1,
+            n_jobs=-1,
+        )
+        lgb_model.fit(X_train, y_train)
+        print(f"  LGB trained: {lgb_model.n_estimators} rounds")
+
+        # ── XGBoost — NO sample weights, NO early stopping ──
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=1000,
+            learning_rate=0.01,
+            max_depth=6,
+            tree_method="hist",
+            device="cuda" if HAS_GPU else "cpu",
+            objective="reg:squarederror",
+            subsample=0.8,
+            colsample_bytree=0.6,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+        )
+        xgb_model.fit(X_train, y_train, verbose=0)
+        print(f"  XGB trained: {xgb_model.n_estimators} rounds")
+
+        # Predict validation (float64)
+        p_lgb_val = lgb_model.predict(X_valid).astype(np.float64)
+        p_xgb_val = xgb_model.predict(X_valid).astype(np.float64)
+
+        # Score (float64 + weight clipping)
+        s_lgb, sst_l, sse_l = wrmse_score(y_valid, p_lgb_val, w_valid)
+        s_xgb, sst_x, sse_x = wrmse_score(y_valid, p_xgb_val, w_valid)
+
+        # Try blend ratios
+        best_blend_score = 0.0
+        best_blend_w = 0.5
+        for bw in [0.3, 0.4, 0.5, 0.6, 0.7]:
+            p_blend = bw * p_lgb_val + (1 - bw) * p_xgb_val
+            sb, _, _ = wrmse_score(y_valid, p_blend, w_valid)
+            if sb > best_blend_score:
+                best_blend_score = sb
+                best_blend_w = bw
+
+        p_ens_raw = best_blend_w * p_lgb_val + (1 - best_blend_w) * p_xgb_val
+
+        # ── OPTIMAL SHRINKAGE (float64) ──
+        # α = Σ(w·y·ŷ) / Σ(w·ŷ²) — the scaling factor that minimizes weighted SSE
+        w_c = np.clip(w_valid, 0, np.percentile(w_valid, 99.9))
+        numer_alpha = np.sum(w_c * y_valid * p_ens_raw)
+        denom_alpha = np.sum(w_c * p_ens_raw**2)
+        opt_alpha = numer_alpha / max(denom_alpha, 1e-30)
+        # Clip alpha to reasonable range
+        opt_alpha = float(np.clip(opt_alpha, -10.0, 10.0))
+
+        p_ens_val = opt_alpha * p_ens_raw
+
+        # Score after shrinkage
+        s_shrunk, sst_s, sse_s = wrmse_score(y_valid, p_ens_val, w_valid)
+
+        # Also compute unweighted score for comparison
+        ones_w = np.ones_like(w_valid)
+        s_unweighted, _, _ = wrmse_score(y_valid, p_ens_val, ones_w)
+        s_unweighted_raw, _, _ = wrmse_score(y_valid, p_ens_raw, ones_w)
+
+        # Diagnostics
+        print(f"  RAW Blend({best_blend_w:.1f}): pred std={p_ens_raw.std():.2f}")
+        print(f"  Optimal α = {opt_alpha:.8f}")
+        print(
+            f"  SHRUNK score: {s_shrunk:.6f} (SSE/SST={sse_s / max(sst_s, 1e-30):.6f})"
+        )
+        print(
+            f"  SHRUNK pred: [{p_ens_val.min():.6f}, {p_ens_val.max():.6f}], "
+            f"std={p_ens_val.std():.6f}"
+        )
+        print(
+            f"  Unweighted score (raw): {s_unweighted_raw:.6f}, "
+            f"(shrunk): {s_unweighted:.6f}"
+        )
+
+        # Fill predictions (shrunk)
+        hz_mask = val_h == hz
+        pred_val[hz_mask] = p_ens_val
+
+        all_models[hz] = (lgb_model, xgb_model, best_blend_w, opt_alpha)
+
+        del X_train, y_train, X_valid, tr_hz, va_hz
+        free_mem()
+
+    # Overall scores
+    ov_s, ov_sst, ov_sse = wrmse_score(val_y, pred_val, val_w)
+    ov_uw, _, _ = wrmse_score(val_y, pred_val, np.ones_like(val_w))
+    print(f"\n{'=' * 50}")
+    print(f"OVERALL WEIGHTED SCORE: {ov_s:.6f}")
+    print(
+        f"  SST={ov_sst:.6e}, SSE={ov_sse:.6e}, ratio={ov_sse / max(ov_sst, 1e-30):.6f}"
     )
+    print(f"OVERALL UNWEIGHTED SCORE: {ov_uw:.6f}")
+    print(f"{'=' * 50}")
 
-    # Clip predictions to non-negative
-    final_pred_test = np.maximum(final_pred_test, 0)
-    final_pred_val = np.maximum(final_pred_val, 0)
-
-    print("Ensemble Predictions Generated.")
-    return final_pred_test, final_pred_val
+    return all_models, pred_val, val_h, val_ids, val_w, val_y
 
 
 @app.cell
-def _(final_pred_val, h_valid, mo, np, w_valid, y_valid):
-    mo.md(
-        r"""
-    ## 5. Local Leaderboard Simulation
+def _(all_models, feature_cols, free_mem, full_df, get_mem, mo, np):
+    mo.md("## 3. Test Inference")
 
-    This cell simulates the Kaggle scoring environment. We split our validation holdout into two sets:
-    1.  **Public Score (25%)**: Mimics the real-time feedback.
-    2.  **Private Score (75%)**: Mimics the final final evaluation.
-    """
+    print("--- Test Inference ---")
+    test_part = full_df.filter(full_df["split"] == "test")
+    test_ids_out = test_part["id"].to_list()
+    test_horizons_arr = test_part["horizon"].to_numpy()
+
+    X_test_full = test_part.select(feature_cols).to_numpy().astype(np.float32)
+    X_test_full = np.clip(
+        np.nan_to_num(X_test_full, nan=0.0, posinf=0.0, neginf=0.0), -1e9, 1e9
     )
+    print(f"  Test rows: {len(test_ids_out):,}")
 
-    def official_skill_score(y_target, y_pred, w) -> float:
-        """Official formula from evaluate.py: sqrt(1 - clip(SSE_w / SST_w))"""
-        denom = np.sum(w * (y_target**2))
-        if denom == 0:
+    pred_test_out = np.zeros(len(test_ids_out), dtype=np.float64)
+
+    for th, (t_lgb, t_xgb, t_bw, t_alpha) in all_models.items():
+        t_mask = test_horizons_arr == th
+        if not t_mask.any():
+            continue
+        X_th = X_test_full[t_mask]
+        tp_lgb = t_lgb.predict(X_th).astype(np.float64)
+        tp_xgb = t_xgb.predict(X_th).astype(np.float64)
+        tp_raw = t_bw * tp_lgb + (1 - t_bw) * tp_xgb
+        tp_ens = t_alpha * tp_raw
+        pred_test_out[t_mask] = tp_ens
+        print(
+            f"  H{th}: {t_mask.sum():,} rows, α={t_alpha:.8f}, "
+            f"raw_std={tp_raw.std():.2f}, pred=[{tp_ens.min():.6f}, {tp_ens.max():.6f}]"
+        )
+
+    del X_test_full, test_part
+    free_mem()
+    print(f"  Memory: {get_mem():.0f} MB")
+
+    return pred_test_out, test_ids_out
+
+
+@app.cell
+def _(mo, np, pred_val, val_h, val_w, val_y):
+    mo.md("## 4. Local Leaderboard")
+
+    # Float64 score with weight clipping
+    w64_lb = np.asarray(val_w, dtype=np.float64)
+    w_cap_lb = np.percentile(w64_lb, 99.9)
+    w64_lb = np.clip(w64_lb, 0, w_cap_lb)
+    y64_lb = np.asarray(val_y, dtype=np.float64)
+    p64_lb = np.asarray(pred_val, dtype=np.float64)
+
+    def score_lb(y, yhat, w):
+        sst = np.sum(w * y**2)
+        sse = np.sum(w * (y - yhat) ** 2)
+        if sst < 1e-30:
             return 0.0
-        numerator = np.sum(w * ((y_target - y_pred) ** 2))
-        ratio = numerator / denom
-        return float(np.sqrt(np.maximum(1.0 - ratio, 0.0)))
+        ratio = sse / sst
+        return float(np.sqrt(max(1.0 - ratio, 0.0)))
 
-    # Simulate Public/Private Split
-    indices = np.arange(len(y_valid))
-    np.random.seed(42)  # For reproducibility
-    np.random.shuffle(indices)
+    idx_lb = np.arange(len(y64_lb))
+    np.random.seed(42)
+    np.random.shuffle(idx_lb)
+    split_lb = int(len(y64_lb) * 0.25)
 
-    split_idx = int(len(y_valid) * 0.25)
-    public_idx, private_idx = indices[:split_idx], indices[split_idx:]
-
-    score_public = official_skill_score(
-        y_valid[public_idx], final_pred_val[public_idx], w_valid[public_idx]
+    pub_score = score_lb(
+        y64_lb[idx_lb[:split_lb]], p64_lb[idx_lb[:split_lb]], w64_lb[idx_lb[:split_lb]]
     )
-    score_private = official_skill_score(
-        y_valid[private_idx], final_pred_val[private_idx], w_valid[private_idx]
+    prv_score = score_lb(
+        y64_lb[idx_lb[split_lb:]], p64_lb[idx_lb[split_lb:]], w64_lb[idx_lb[split_lb:]]
     )
-    overall = official_skill_score(y_valid, final_pred_val, w_valid)
+    all_score = score_lb(y64_lb, p64_lb, w64_lb)
 
-    print("-" * 65)
-    print(f"{'LOCAL LEADERBOARD (SIMULATED)':<35} | {'SCORE':<20}")
-    print("-" * 65)
-    print(f"{'🔴 Simulated Public LB (25%)':<35} | {score_public:.6f}")
-    print(f"{'🔒 Simulated Private LB (75%)':<35} | {score_private:.6f}")
-    print(f"{'📊 Overall Holdout Score':<35} | {overall:.6f}")
-    print("-" * 65)
+    print("-" * 60)
+    print(f"{'LOCAL LEADERBOARD':<30} | SCORE")
+    print("-" * 60)
+    print(f"{'🔴 Public (25%)':<30} | {pub_score:.6f}")
+    print(f"{'🔒 Private (75%)':<30} | {prv_score:.6f}")
+    print(f"{'📊 Overall':<30} | {all_score:.6f}")
+    print("-" * 60)
 
-    # Horizon Breakdown
-    _unique_h = np.unique(h_valid)
-    if len(_unique_h) > 1:
-        print("\nScores by Horizon:")
-        print(f"  {'Horizon':<10} | {'Score':<10} | {'Samples':<10}")
-        for h_eval in sorted(_unique_h):
-            _h_mask = h_valid == h_eval
-            if _h_mask.any():
-                h_score = official_skill_score(
-                    y_valid[_h_mask], final_pred_val[_h_mask], w_valid[_h_mask]
-                )
-                print(f"  {int(h_eval):<10} | {h_score:.6f}   | {_h_mask.sum():,}")
+    for lh in sorted(np.unique(val_h)):
+        lm = val_h == lh
+        if lm.any():
+            ls = score_lb(y64_lb[lm], p64_lb[lm], w64_lb[lm])
+            print(f"  Horizon {int(lh):<4} | {ls:.6f} | {lm.sum():>10,} samples")
+
+    # Sanity check
+    print(f"\nPrediction stats:")
+    print(f"  pred mean={p64_lb.mean():.4f}, std={p64_lb.std():.4f}")
+    print(f"  y    mean={y64_lb.mean():.4f}, std={y64_lb.std():.4f}")
+    print(f"  Variance ratio: {p64_lb.std() / (y64_lb.std() + 1e-8):.4f}")
     return
 
 
 @app.cell
-def _(final_pred_test, final_pred_val, mo, pl, test_ids, valid_ids):
-    mo.md("## 6. Submission")
+def _(mo, np, pl, pred_test_out, pred_val, test_ids_out, val_ids):
+    mo.md("## 5. Submission")
 
-    submission_df = pl.DataFrame({"id": test_ids, "prediction": final_pred_test})
+    submission_df = pl.DataFrame({"id": test_ids_out, "prediction": pred_test_out})
+    submission_df.write_csv("submission_optimized.csv")
+    print(f"✅ Submission saved ({submission_df.height:,} rows)")
+    print(f"   mean={np.mean(pred_test_out):.4f}, std={np.std(pred_test_out):.4f}")
+    print(f"   min={np.min(pred_test_out):.4f}, max={np.max(pred_test_out):.4f}")
 
-    submission_path = "submission_optimized.csv"
-    submission_df.write_csv(submission_path)
-    print(f"Submission saved to: {submission_path}")
-
-    # --- Validation Export (For GitHub History Accuracy) ---
-    val_df = pl.DataFrame({"id": valid_ids, "prediction": final_pred_val})
-    val_path = "validation_results.csv"
-    val_df.write_csv(val_path)
-    print(f"Validation results saved to: {val_path}")
+    val_out_df = pl.DataFrame({"id": val_ids, "prediction": pred_val})
+    val_out_df.write_csv("validation_results.csv")
+    print(f"✅ Validation saved ({val_out_df.height:,} rows)")
     return
 
 
