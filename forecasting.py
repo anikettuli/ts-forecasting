@@ -27,9 +27,9 @@ def _():
 
         torch.set_float32_matmul_precision("medium")
         HAS_GPU = torch.cuda.is_available()
-        print(f"✅ Torch available. CUDA: {HAS_GPU}")
+        print(f"Torch available. CUDA: {HAS_GPU}")
     except ImportError:
-        print("⚠️ Torch not found. GPU disabled.")
+        print("Torch not found. GPU disabled.")
 
     def get_mem():
         return psutil.Process().memory_info().rss / 1024 / 1024
@@ -44,12 +44,12 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # 📈 Time-Series Forecasting v5 — Fixed Pipeline
+    # Time-Series Forecasting v5 - Fixed Pipeline
 
     **Critical fixes over v4:**
     1. Temporal features computed on COMBINED train+test (no broken lag anchors)
     2. No per-series normalization (predict raw y_target directly)
-    3. No shrinkage (let the model predict at full scale)
+    3. Simple scaling (let the model predict at full scale)
     4. Causal target encoding for code/sub_code
     5. Per-horizon models with early stopping + 1500 trees
     """)
@@ -462,14 +462,19 @@ def _(HAS_GPU, feature_cols, free_mem, full_df, get_mem, lgb, mo, np, xgb):
 
         p_ens_raw = best_blend_w * p_lgb_val + (1 - best_blend_w) * p_xgb_val
 
-        # ── OPTIMAL SHRINKAGE (float64) ──
-        # α = Σ(w·y·ŷ) / Σ(w·ŷ²) — the scaling factor that minimizes weighted SSE
-        w_c = np.clip(w_valid, 0, np.percentile(w_valid, 99.9))
-        numer_alpha = np.sum(w_c * y_valid * p_ens_raw)
-        denom_alpha = np.sum(w_c * p_ens_raw**2)
-        opt_alpha = numer_alpha / max(denom_alpha, 1e-30)
-        # Clip alpha to reasonable range
-        opt_alpha = float(np.clip(opt_alpha, -10.0, 10.0))
+        # ── SCALING: Use simple mean ratio instead of optimal shrinkage ──
+        # The optimal shrinkage is causing predictions to become too small
+        # Use simple scaling: scale predictions to match target mean
+        mean_y = np.mean(y_valid)
+        mean_p = np.mean(p_ens_raw)
+        # Simple linear scaling
+        if abs(mean_p) > 1e-6:
+            opt_alpha = mean_y / mean_p
+        else:
+            opt_alpha = 1.0
+
+        # Clip to reasonable range
+        opt_alpha = float(np.clip(opt_alpha, 0.5, 5.0))
 
         p_ens_val = opt_alpha * p_ens_raw
 
@@ -483,7 +488,7 @@ def _(HAS_GPU, feature_cols, free_mem, full_df, get_mem, lgb, mo, np, xgb):
 
         # Diagnostics
         print(f"  RAW Blend({best_blend_w:.1f}): pred std={p_ens_raw.std():.2f}")
-        print(f"  Optimal α = {opt_alpha:.8f}")
+        print(f"  Optimal alpha = {opt_alpha:.8f}")
         print(
             f"  SHRUNK score: {s_shrunk:.6f} (SSE/SST={sse_s / max(sst_s, 1e-30):.6f})"
         )
@@ -593,9 +598,9 @@ def _(mo, np, pred_val, val_h, val_w, val_y):
     print("-" * 60)
     print(f"{'LOCAL LEADERBOARD':<30} | SCORE")
     print("-" * 60)
-    print(f"{'🔴 Public (25%)':<30} | {pub_score:.6f}")
-    print(f"{'🔒 Private (75%)':<30} | {prv_score:.6f}")
-    print(f"{'📊 Overall':<30} | {all_score:.6f}")
+    print(f"{'Public (25%)':<30} | {pub_score:.6f}")
+    print(f"{'Private (75%)':<30} | {prv_score:.6f}")
+    print(f"{'Overall':<30} | {all_score:.6f}")
     print("-" * 60)
 
     for lh in sorted(np.unique(val_h)):
@@ -618,13 +623,13 @@ def _(mo, np, pl, pred_test_out, pred_val, test_ids_out, val_ids):
 
     submission_df = pl.DataFrame({"id": test_ids_out, "prediction": pred_test_out})
     submission_df.write_csv("submission_optimized.csv")
-    print(f"✅ Submission saved ({submission_df.height:,} rows)")
+    print(f"Submission saved ({submission_df.height:,} rows)")
     print(f"   mean={np.mean(pred_test_out):.4f}, std={np.std(pred_test_out):.4f}")
     print(f"   min={np.min(pred_test_out):.4f}, max={np.max(pred_test_out):.4f}")
 
     val_out_df = pl.DataFrame({"id": val_ids, "prediction": pred_val})
     val_out_df.write_csv("validation_results.csv")
-    print(f"✅ Validation saved ({val_out_df.height:,} rows)")
+    print(f"Validation saved ({val_out_df.height:,} rows)")
     return
 
 
