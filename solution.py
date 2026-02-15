@@ -1,19 +1,14 @@
 """
-Time Series Forecasting Solution v5 - Best Working Approach
-============================================================
-Current Best Local Score: 0.1506
-Kaggle Score: 0.1711 (from previous submission with temporal features)
+Time Series Forecasting Solution v6
+===================================
+Current Best Local Score: 0.1506 (multi-seed ensemble)
+Previous Kaggle Score: 0.1711 (with temporal features from forecasting.py)
 Target: > 0.25
 
 Key insights:
-- Simple historical aggregates + LGB ensemble = 0.14-0.15 local
-- To reach 0.17+ on Kaggle, need temporal features + target encoding
-- The forecasting.py notebook has the full pipeline but is slow
-
-Approach:
-- Multi-seed LGB ensemble (5 diverse configs)
-- Horizon-specific models with blend optimization
-- Historical aggregate baseline
+- Target encoding + cyclical features: 0.1424
+- Multi-seed LGB ensemble: 0.1506
+- Need temporal features for 0.17+
 """
 
 import polars as pl
@@ -31,7 +26,7 @@ def weighted_rmse_score(y_true, y_pred, weights):
 
 
 print("=" * 70)
-print("TIME SERIES FORECASTING SOLUTION v5 - Multi-Seed Ensemble")
+print("TIME SERIES FORECASTING SOLUTION v6 - Target Encoding + Multi-Seed")
 print("=" * 70)
 
 train = pl.read_parquet("data/train.parquet")
@@ -45,12 +40,12 @@ split_ts = int(max_ts * 0.9)
 tr = train.filter(pl.col("ts_index") < split_ts)
 va = train.filter(pl.col("ts_index") >= split_ts)
 
-print(f"Train: {tr.shape[0]:,}, Valid: {va.shape[0]:,}")
+print(f"Train: {tr.height:,}, Valid: {va.height:,}")
 
 global_mean = tr["y_target"].mean()
 raw_features = [c for c in train.columns if c.startswith("feature_")]
 
-print("Creating historical aggregates...")
+print("Creating features...")
 hist_cc = tr.group_by(["code", "sub_category", "horizon"]).agg(
     [
         pl.col("y_target").mean().alias("hist_mean"),
@@ -58,16 +53,44 @@ hist_cc = tr.group_by(["code", "sub_category", "horizon"]).agg(
 )
 hist_cc = hist_cc.with_columns(pl.col("horizon").cast(pl.Int32))
 
+code_te = tr.group_by("code").agg(pl.col("y_target").mean().alias("code_te"))
+sub_code_te = tr.group_by("sub_code").agg(
+    pl.col("y_target").mean().alias("sub_code_te")
+)
 
-def add_hist(df):
-    return df.join(
-        hist_cc, on=["code", "sub_category", "horizon"], how="left"
-    ).fill_null(global_mean)
+
+def add_features(df):
+    df = df.join(hist_cc, on=["code", "sub_category", "horizon"], how="left")
+    df = df.join(code_te, on="code", how="left")
+    df = df.join(sub_code_te, on="sub_code", how="left")
+    df = df.fill_null(global_mean)
+    df = df.with_columns(
+        [
+            (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_sin"),
+            (np.cos(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_cos"),
+        ]
+    )
+    return df
 
 
-tr = add_hist(tr)
-va = add_hist(va)
-test = add_hist(test)
+tr = add_features(tr)
+va = add_features(va)
+test = add_features(test)
+
+train_sub_codes = set(tr["sub_code"].unique().to_list())
+tr = tr.with_columns(pl.lit(0).alias("is_cold"))
+va = va.with_columns(
+    pl.when(pl.col("sub_code").is_in(train_sub_codes))
+    .then(0)
+    .otherwise(1)
+    .alias("is_cold")
+)
+test = test.with_columns(
+    pl.when(pl.col("sub_code").is_in(train_sub_codes))
+    .then(0)
+    .otherwise(1)
+    .alias("is_cold")
+)
 
 tr_pd = tr.to_pandas()
 va_pd = va.to_pandas()
@@ -82,18 +105,26 @@ for fc in raw_features:
     va_pd[fc] = va_pd[fc].fillna(m)
     test_pd[fc] = test_pd[fc].fillna(m)
 
-feature_cols = raw_features + ["horizon", "hist_mean"]
+feature_cols = raw_features + [
+    "horizon",
+    "hist_mean",
+    "code_te",
+    "sub_code_te",
+    "is_cold",
+    "dow_sin",
+    "dow_cos",
+]
 horizons = [1, 3, 10, 25]
 
 preds_va = np.zeros(len(va_pd))
 preds_test = np.zeros(len(test_pd))
+val_h = va_pd["horizon"].values
+test_h = test_pd["horizon"].values
 
 configs = [
     {"seed": 42, "leaves": 127, "lr": 0.02},
     {"seed": 123, "leaves": 63, "lr": 0.03},
     {"seed": 456, "leaves": 255, "lr": 0.015},
-    {"seed": 789, "leaves": 127, "lr": 0.025},
-    {"seed": 999, "leaves": 63, "lr": 0.04},
 ]
 
 print("\n" + "=" * 70)
@@ -121,7 +152,6 @@ for h in horizons:
     hist_va_h = va_pd.loc[va_h_mask, "hist_mean"].values
 
     X_test = test_pd.loc[test_h_mask, feature_cols].values.astype(np.float32)
-    hist_test_h = test_pd.loc[test_h_mask, "hist_mean"].values
 
     pred_va_list = []
     pred_test_list = []
@@ -148,9 +178,9 @@ for h in horizons:
                 "seed": cfg["seed"],
             },
             lgb_train,
-            num_boost_round=1000,
+            num_boost_round=500,
             valid_sets=[lgb_valid],
-            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)],
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
         )
         pred_va_list.append(m.predict(X_va))
         pred_test_list.append(m.predict(X_test))
@@ -175,7 +205,8 @@ for h in horizons:
         best_alpha * pred_va_avg + (1 - best_alpha) * hist_va_h
     )
     preds_test[test_h_mask.to_numpy()] = (
-        best_alpha * pred_test_avg + (1 - best_alpha) * hist_test_h
+        best_alpha * pred_test_avg
+        + (1 - best_alpha) * test_pd.loc[test_h_mask, "hist_mean"].values
     )
 
     del tr_h
