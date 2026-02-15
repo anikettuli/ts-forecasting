@@ -1,14 +1,19 @@
 """
-Time Series Forecasting Solution v5
-===================================
-Current Score: 0.1506
+Time Series Forecasting Solution v5 - Best Working Approach
+============================================================
+Current Best Local Score: 0.1506
+Kaggle Score: 0.1711 (from previous submission with temporal features)
 Target: > 0.25
 
-Key improvements:
-- Multi-seed ensemble (5 diverse configs)
-- Horizon-specific models
-- Historical aggregate baseline blend
-- Proper weight clipping
+Key insights:
+- Simple historical aggregates + LGB ensemble = 0.14-0.15 local
+- To reach 0.17+ on Kaggle, need temporal features + target encoding
+- The forecasting.py notebook has the full pipeline but is slow
+
+Approach:
+- Multi-seed LGB ensemble (5 diverse configs)
+- Horizon-specific models with blend optimization
+- Historical aggregate baseline
 """
 
 import polars as pl
