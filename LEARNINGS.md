@@ -5,10 +5,13 @@
 | Version | Score | Change |
 |---------|-------|--------|
 | Baseline (v6) | 0.1592 | Starting point |
-| v8 | 0.1671 | +0.0079 - Best achieved |
+| v8 | 0.1671 | +0.0079 - Best code tracked |
+| **Best submission** | **0.1711** | **Best score (commit 36b6006, code not tracked)** |
 | v13 (log weights) | 0.1652 | -0.0019 - Regression |
 | v14 (raw weights + 800 rounds) | 0.1561 | -0.0110 - Major regression |
 | v11 (diverse configs) | 0.1628 | -0.0043 - Regression |
+
+**Note**: The 0.1711 submission exists but the solution.py that produced it wasn't tracked.
 
 ---
 
