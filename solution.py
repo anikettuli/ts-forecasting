@@ -1,14 +1,7 @@
 """
-Time Series Forecasting Solution v6
-===================================
-Current Best Local Score: 0.1506 (multi-seed ensemble)
-Previous Kaggle Score: 0.1711 (with temporal features from forecasting.py)
-Target: > 0.25
-
-Key insights:
-- Target encoding + cyclical features: 0.1424
-- Multi-seed LGB ensemble: 0.1506
-- Need temporal features for 0.17+
+Time Series Forecasting Solution v8 - Restored Best
+Score: 0.1671
+Target: > 0.35
 """
 
 import polars as pl
@@ -26,7 +19,7 @@ def weighted_rmse_score(y_true, y_pred, weights):
 
 
 print("=" * 70)
-print("TIME SERIES FORECASTING SOLUTION v6 - Target Encoding + Multi-Seed")
+print("TIME SERIES FORECASTING SOLUTION v8 - Restored Best")
 print("=" * 70)
 
 train = pl.read_parquet("data/train.parquet")
@@ -42,32 +35,42 @@ va = train.filter(pl.col("ts_index") >= split_ts)
 
 print(f"Train: {tr.height:,}, Valid: {va.height:,}")
 
-global_mean = tr["y_target"].mean()
 raw_features = [c for c in train.columns if c.startswith("feature_")]
+global_mean = tr["y_target"].mean()
+y_min = tr["y_target"].quantile(0.001)
+y_max = tr["y_target"].quantile(0.999)
 
-print("Creating features...")
-hist_cc = tr.group_by(["code", "sub_category", "horizon"]).agg(
-    [
-        pl.col("y_target").mean().alias("hist_mean"),
-    ]
-)
-hist_cc = hist_cc.with_columns(pl.col("horizon").cast(pl.Int32))
+print("Creating encodings...")
 
 code_te = tr.group_by("code").agg(pl.col("y_target").mean().alias("code_te"))
 sub_code_te = tr.group_by("sub_code").agg(
     pl.col("y_target").mean().alias("sub_code_te")
 )
+hist = tr.group_by(["code", "sub_category", "horizon"]).agg(
+    [
+        pl.col("y_target").mean().alias("hist_mean"),
+        pl.col("y_target").std().alias("hist_std"),
+    ]
+)
+hist = hist.with_columns(pl.col("hist_std").fill_null(0.0))
+
+train_sub_codes = set(tr["sub_code"].unique().to_list())
 
 
 def add_features(df):
-    df = df.join(hist_cc, on=["code", "sub_category", "horizon"], how="left")
     df = df.join(code_te, on="code", how="left")
     df = df.join(sub_code_te, on="sub_code", how="left")
+    df = df.join(hist, on=["code", "sub_category", "horizon"], how="left")
     df = df.fill_null(global_mean)
     df = df.with_columns(
         [
+            pl.col("hist_std").fill_null(0.0),
             (np.sin(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_sin"),
             (np.cos(2 * np.pi * (pl.col("ts_index") % 7) / 7.0)).alias("dow_cos"),
+            pl.when(pl.col("sub_code").is_in(train_sub_codes))
+            .then(0)
+            .otherwise(1)
+            .alias("is_cold"),
         ]
     )
     return df
@@ -77,26 +80,24 @@ tr = add_features(tr)
 va = add_features(va)
 test = add_features(test)
 
-train_sub_codes = set(tr["sub_code"].unique().to_list())
-tr = tr.with_columns(pl.lit(0).alias("is_cold"))
-va = va.with_columns(
-    pl.when(pl.col("sub_code").is_in(train_sub_codes))
-    .then(0)
-    .otherwise(1)
-    .alias("is_cold")
-)
-test = test.with_columns(
-    pl.when(pl.col("sub_code").is_in(train_sub_codes))
-    .then(0)
-    .otherwise(1)
-    .alias("is_cold")
-)
+feature_cols = raw_features + [
+    "horizon",
+    "code_te",
+    "sub_code_te",
+    "hist_mean",
+    "hist_std",
+    "is_cold",
+    "dow_sin",
+    "dow_cos",
+]
 
-tr_pd = tr.to_pandas()
-va_pd = va.to_pandas()
-test_pd = test.to_pandas()
+tr_pd = tr.select(feature_cols + ["y_target", "weight"]).to_pandas()
+va_pd = va.select(feature_cols + ["y_target", "weight", "id"]).to_pandas()
+test_pd = test.select(feature_cols + ["id"]).to_pandas()
 
-del tr, va, test
+test_ids = test_pd["id"].tolist()
+
+del tr, va, test, train
 gc.collect()
 
 for fc in raw_features:
@@ -105,63 +106,52 @@ for fc in raw_features:
     va_pd[fc] = va_pd[fc].fillna(m)
     test_pd[fc] = test_pd[fc].fillna(m)
 
-feature_cols = raw_features + [
-    "horizon",
-    "hist_mean",
-    "code_te",
-    "sub_code_te",
-    "is_cold",
-    "dow_sin",
-    "dow_cos",
-]
 horizons = [1, 3, 10, 25]
-
 preds_va = np.zeros(len(va_pd))
 preds_test = np.zeros(len(test_pd))
-val_h = va_pd["horizon"].values
-test_h = test_pd["horizon"].values
-
-configs = [
-    {"seed": 42, "leaves": 127, "lr": 0.02},
-    {"seed": 123, "leaves": 63, "lr": 0.03},
-    {"seed": 456, "leaves": 255, "lr": 0.015},
-]
 
 print("\n" + "=" * 70)
-print("TRAINING MULTI-SEED ENSEMBLE")
+print("TRAINING MULTI-SEED LGBM ENSEMBLE")
 print("=" * 70)
+
+seeds = [42, 123, 456]
+leaves = [63, 127, 31]
+lrs = [0.03, 0.02, 0.04]
 
 for h in horizons:
     print(f"\n--- Horizon {h} ---")
 
-    tr_h = tr_pd[tr_pd["horizon"] == h]
-    va_h_mask = va_pd["horizon"] == h
-    test_h_mask = test_pd["horizon"] == h
+    tr_mask = tr_pd["horizon"] == h
+    va_mask = va_pd["horizon"] == h
+    te_mask = test_pd["horizon"] == h
 
-    X_tr = tr_h[feature_cols].values.astype(np.float32)
-    y_tr = tr_h["y_target"].values
+    X_tr = tr_pd.loc[tr_mask, feature_cols].values.astype(np.float32)
+    y_tr = tr_pd.loc[tr_mask, "y_target"].values
     w_tr = np.clip(
-        tr_h["weight"].fillna(1.0).values,
+        tr_pd.loc[tr_mask, "weight"].fillna(1.0).values,
         0,
-        np.percentile(tr_h["weight"].fillna(1.0).values, 99.9),
+        np.percentile(tr_pd.loc[tr_mask, "weight"].fillna(1.0).values, 99.9),
     )
 
-    X_va = va_pd.loc[va_h_mask, feature_cols].values.astype(np.float32)
-    y_va_h = va_pd.loc[va_h_mask, "y_target"].values
-    w_va_h = va_pd.loc[va_h_mask, "weight"].fillna(1.0).values
-    hist_va_h = va_pd.loc[va_h_mask, "hist_mean"].values
+    X_va = va_pd.loc[va_mask, feature_cols].values.astype(np.float32)
+    y_va = va_pd.loc[va_mask, "y_target"].values
+    w_va = va_pd.loc[va_mask, "weight"].fillna(1.0).values
+    hist_va = va_pd.loc[va_mask, "hist_mean"].values
 
-    X_test = test_pd.loc[test_h_mask, feature_cols].values.astype(np.float32)
+    X_te = test_pd.loc[te_mask, feature_cols].values.astype(np.float32)
+    hist_te = test_pd.loc[te_mask, "hist_mean"].values
 
-    pred_va_list = []
-    pred_test_list = []
+    print(f"Train: {len(X_tr):,}, Val: {len(X_va):,}")
 
-    for cfg in configs:
+    pred_va_seeds = []
+    pred_te_seeds = []
+
+    for seed, leaf, lr in zip(seeds, leaves, lrs):
         lgb_train = lgb.Dataset(X_tr, y_tr, weight=w_tr)
         lgb_valid = lgb.Dataset(
             X_va,
-            y_va_h,
-            weight=np.clip(w_va_h, 0, np.percentile(w_va_h, 99.9)),
+            y_va,
+            weight=np.clip(w_va, 0, np.percentile(w_va, 99.9)),
             reference=lgb_train,
         )
 
@@ -169,47 +159,47 @@ for h in horizons:
             {
                 "objective": "regression",
                 "metric": "rmse",
-                "num_leaves": cfg["leaves"],
-                "learning_rate": cfg["lr"],
+                "num_leaves": leaf,
+                "learning_rate": lr,
                 "feature_fraction": 0.8,
                 "bagging_fraction": 0.8,
                 "verbose": -1,
                 "n_jobs": -1,
-                "seed": cfg["seed"],
+                "seed": seed,
+                "reg_alpha": 0.1,
+                "reg_lambda": 0.1,
             },
             lgb_train,
             num_boost_round=500,
             valid_sets=[lgb_valid],
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+            callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)],
         )
-        pred_va_list.append(m.predict(X_va))
-        pred_test_list.append(m.predict(X_test))
 
-    pred_va_avg = np.mean(pred_va_list, axis=0)
-    pred_test_avg = np.mean(pred_test_list, axis=0)
+        pred_va_seeds.append(m.predict(X_va))
+        pred_te_seeds.append(m.predict(X_te))
 
-    best_s = 0
-    best_alpha = 0
-    for alpha in np.arange(0, 1.01, 0.05):
-        p = alpha * pred_va_avg + (1 - alpha) * hist_va_h
-        s = weighted_rmse_score(y_va_h, p, w_va_h)
+    pred_va_avg = np.mean(pred_va_seeds, axis=0)
+    pred_te_avg = np.mean(pred_te_seeds, axis=0)
+
+    s_lgb = weighted_rmse_score(y_va, pred_va_avg, w_va)
+    s_hist = weighted_rmse_score(y_va, hist_va, w_va)
+
+    best_s, best_alpha = 0, 0.5
+    for alpha in np.arange(0.5, 1.01, 0.05):
+        p = alpha * pred_va_avg + (1 - alpha) * hist_va
+        s = weighted_rmse_score(y_va, p, w_va)
         if s > best_s:
             best_s = s
             best_alpha = alpha
 
     print(
-        f"Best blend: {best_alpha:.2f} LGB + {1 - best_alpha:.2f} hist = {best_s:.4f}"
+        f"LGB: {s_lgb:.4f}, Hist: {s_hist:.4f}, Blend({best_alpha:.2f}): {best_s:.4f}"
     )
 
-    preds_va[va_h_mask.to_numpy()] = (
-        best_alpha * pred_va_avg + (1 - best_alpha) * hist_va_h
-    )
-    preds_test[test_h_mask.to_numpy()] = (
-        best_alpha * pred_test_avg
-        + (1 - best_alpha) * test_pd.loc[test_h_mask, "hist_mean"].values
-    )
+    preds_va[va_mask.values] = best_alpha * pred_va_avg + (1 - best_alpha) * hist_va
+    preds_test[te_mask.values] = best_alpha * pred_te_avg + (1 - best_alpha) * hist_te
 
-    del tr_h
+    del X_tr, y_tr, w_tr, X_va, y_va, w_va
     gc.collect()
 
 overall = weighted_rmse_score(
@@ -220,8 +210,9 @@ print(f"\n{'=' * 70}")
 print(f"FINAL VALIDATION SCORE: {overall:.4f}")
 print(f"{'=' * 70}")
 
-sub = test_pd[["id"]].copy()
-sub["prediction"] = preds_test
-sub.to_csv("submission_optimized.csv", index=False)
+preds_test = np.clip(preds_test, y_min, y_max)
+
+sub = pl.DataFrame({"id": test_ids, "prediction": preds_test})
+sub.write_csv("submission_optimized.csv")
 print(f"\nSaved: submission_optimized.csv")
-print(f"Predictions: mean={preds_test.mean():.4f}, std={preds_test.std():.4f}")
+print(f"Mean: {preds_test.mean():.4f}, Std: {preds_test.std():.4f}")
