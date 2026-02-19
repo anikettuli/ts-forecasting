@@ -203,9 +203,9 @@ def main():
     print("-" * 65)
     print(f"{'LOCAL LEADERBOARD (PROXY BENCHMARK)':<35} | {'SCORE':<20}")
     print("-" * 65)
-    print(f"{'🔴 Benchmark Public LB (25%)':<35} | {score_pub:.6f}")
-    print(f"{'🔒 Benchmark Private LB (75%)':<35} | {score_priv:.6f}")
-    print(f"{'📊 Overall Proxy Score':<35} | {score_overall:.6f}")
+    print(f"{'Benchmark Public LB (25%)':<35} | {score_pub:.6f}")
+    print(f"{'Benchmark Private LB (75%)':<35} | {score_priv:.6f}")
+    print(f"{'Overall Proxy Score':<35} | {score_overall:.6f}")
     print("-" * 65)
     print("NOTE: These scores are Naive Baselines because Test Lables are hidden.")
 
